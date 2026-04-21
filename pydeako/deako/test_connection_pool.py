@@ -1669,3 +1669,137 @@ def test_on_connection_lost_noop_when_stopped():
     # Does not raise; does not schedule anything.
     # pylint: disable-next=protected-access
     pool._on_active_connection_lost()
+
+
+# --- fix(pool): stop-race and same-host guards --------------------
+
+def test_init_rejects_same_host_primary_and_failover():
+    """Constructor rejects single-bridge configuration per docstring.
+
+    The pool docstring promises single-bridge pools are unsupported;
+    constructing one must raise ValueError rather than silently
+    returning a pool whose failover target equals its primary.
+    """
+    with pytest.raises(ValueError):
+        DeakoConnectionPool(
+            primary_host="10.0.0.1",
+            failover_host="10.0.0.1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_start_discards_new_active_if_stopped_mid_connect():
+    """stop() during start()'s connect must not install late Deako.
+
+    If _connect_primary is in flight when stop() sets _stopped=True,
+    the freshly connected Deako returned after the await must be
+    disconnected and discarded, not installed on self.active.
+    """
+    pool = DeakoConnectionPool(
+        primary_host="10.0.0.1", failover_host="10.0.0.2",
+    )
+    new_active = _fake_deako_connected()
+    release = asyncio.Event()
+
+    async def blocked(_host):
+        await release.wait()
+        return new_active
+
+    with patch.object(
+        DeakoConnectionPool,
+        "_connect_primary",
+        new=AsyncMock(side_effect=blocked),
+    ):
+        start_task = asyncio.create_task(pool.start())
+        # Yield so start_task enters the connect await.
+        await asyncio.sleep(0)
+        await pool.stop()
+        release.set()
+        await start_task
+    assert pool.active is None
+    # pylint: disable-next=protected-access
+    assert pool._started is False
+    new_active.disconnect.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_switch_discards_new_active_if_stopped_mid_connect():
+    """stop() during _switch_to_failover must not install late Deako.
+
+    If _connect_with_retry is in flight when stop() sets _stopped,
+    the switch must disconnect the freshly connected Deako, return
+    False, and leave the host map untouched.
+    """
+    pool, _active, _ka = _started_pool(
+        primary="10.0.0.1", failover="10.0.0.2",
+    )
+    new_active = _fake_deako_connected()
+    release = asyncio.Event()
+
+    async def blocked(_host):
+        await release.wait()
+        return new_active
+
+    with patch.object(
+        pool, "_wait_ready", AsyncMock(return_value=True),
+    ):
+        with patch.object(
+            pool, "_connect_with_retry",
+            AsyncMock(side_effect=blocked),
+        ):
+            # pylint: disable-next=protected-access
+            switch_task = asyncio.create_task(
+                pool._switch_to_failover(failed_host="10.0.0.1"),
+            )
+            await asyncio.sleep(0)
+            await pool.stop()
+            release.set()
+            ok = await switch_task
+    assert ok is False
+    assert pool.active is None
+    assert pool.primary_host == "10.0.0.1"
+    assert pool.failover_host == "10.0.0.2"
+    new_active.disconnect.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_discards_new_active_if_stopped_mid_connect():
+    """stop() during _attempt_recovery must not install late Deako.
+
+    If _connect_with_retry is in flight when stop() sets _stopped,
+    recovery must disconnect the freshly connected Deako, return
+    (False, reasons) with "stopped" tokens, and leave host map alone.
+    """
+    pool, _active, _ka = _started_pool(
+        primary="10.0.0.1", failover="10.0.0.2",
+    )
+    new_deako = _fake_deako_connected()
+    release = asyncio.Event()
+
+    async def blocked(_host):
+        await release.wait()
+        return new_deako
+
+    with patch(
+        "pydeako.deako._connection_pool._tcp_probe",
+        new=AsyncMock(return_value=True),
+    ):
+        with patch.object(
+            pool, "_connect_with_retry",
+            AsyncMock(side_effect=blocked),
+        ):
+            # pylint: disable-next=protected-access
+            rec_task = asyncio.create_task(pool._attempt_recovery())
+            await asyncio.sleep(0)
+            await pool.stop()
+            release.set()
+            ok, reasons = await rec_task
+    assert ok is False
+    assert reasons == {
+        "10.0.0.1": "stopped",
+        "10.0.0.2": "stopped",
+    }
+    assert pool.active is None
+    assert pool.primary_host == "10.0.0.1"
+    assert pool.failover_host == "10.0.0.2"
+    new_deako.disconnect.assert_awaited()

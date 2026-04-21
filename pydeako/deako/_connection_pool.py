@@ -20,6 +20,7 @@ that want a fresh pool must construct a new one. Host names
 pool and never nulled out on any path; degraded state is signaled
 through `ConnectionPoolState`, not missing host fields.
 """
+# pylint: disable=too-many-lines
 
 import asyncio
 import logging
@@ -218,6 +219,12 @@ class DeakoConnectionPool:
         async setup satisfies this naturally. This PR does not add a
         start-lock (decision 9).
         """
+        if primary_host == failover_host:
+            raise ValueError(
+                "DeakoConnectionPool: primary_host and "
+                "failover_host must be distinct; use Deako "
+                "directly for single-bridge setups",
+            )
         self.primary_host: str = primary_host
         self.failover_host: str = failover_host
         self._client_name = client_name
@@ -367,6 +374,23 @@ class DeakoConnectionPool:
                 f"start: primary {self.primary_host} unreachable: "
                 f"{exc}",
             ) from exc
+        # Post-await stopped re-check (decision 22). If stop() ran
+        # while the long connect was in flight, discard the freshly
+        # connected Deako rather than installing it on a pool the
+        # caller has already terminated.
+        if self._stopped:
+            try:
+                await asyncio.wait_for(
+                    new_active.disconnect(),
+                    timeout=STEP_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "active.disconnect() timed out after %ss; "
+                    "proceeding",
+                    STEP_TIMEOUT_S,
+                )
+            return
         # Primary is live. Latch started BEFORE best-effort keepalive
         # so a keepalive failure does not un-set it (decision 9 and
         # decision 27 combined).
@@ -679,6 +703,23 @@ class DeakoConnectionPool:
                         "switch: connect_exhausted on %s", target,
                     )
                     return False
+                # Step 11: post-await stopped re-check (decision 22).
+                # If stop() ran while _connect_with_retry was in
+                # flight, discard the freshly connected Deako and
+                # bail without mutating the host map.
+                if self._stopped:
+                    try:
+                        await asyncio.wait_for(
+                            new_active.disconnect(),
+                            timeout=STEP_TIMEOUT_S,
+                        )
+                    except asyncio.TimeoutError:
+                        _LOGGER.warning(
+                            "active.disconnect() timed out after"
+                            " %ss; proceeding",
+                            STEP_TIMEOUT_S,
+                        )
+                    return False
                 # Step 12: success. Swap host map, install new
                 # active, replay callbacks, start keepalive best
                 # effort on the former primary.
@@ -746,7 +787,7 @@ class DeakoConnectionPool:
                 "on_failover_switch callback error: %s", exc,
             )
 
-    # pylint: disable-next=too-many-return-statements,too-many-branches
+    # pylint: disable-next=too-many-return-statements,too-many-branches,too-many-statements
     async def _attempt_recovery(
         self,
     ) -> tuple[bool, dict[str, str]]:
@@ -845,6 +886,23 @@ class DeakoConnectionPool:
                             return False, _fill_both("stopped")
                         reasons[target] = "connect_exhausted"
                         continue
+                    # Post-await stopped re-check (decision 22). If
+                    # stop() ran while _connect_with_retry was in
+                    # flight, discard the freshly connected Deako
+                    # and bail without mutating the host map.
+                    if self._stopped:
+                        try:
+                            await asyncio.wait_for(
+                                new_deako.disconnect(),
+                                timeout=STEP_TIMEOUT_S,
+                            )
+                        except asyncio.TimeoutError:
+                            _LOGGER.warning(
+                                "active.disconnect() timed out "
+                                "after %ss; proceeding",
+                                STEP_TIMEOUT_S,
+                            )
+                        return False, _fill_both("stopped")
                     # Success on this target.
                     self.active = new_deako
                     self._replay_callbacks(new_deako)
