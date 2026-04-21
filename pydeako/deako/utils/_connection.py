@@ -58,13 +58,21 @@ class _Connection:
         self.init_run()
 
     async def send_data(self, data_to_send: str) -> None:
-        """Send data to socket."""
+        """Send data to socket.
+
+        Narrow catch: only OSError (which includes NoSocketException
+        via its OSError inheritance) is caught to flip state to ERROR
+        before re-raising. Other exceptions propagate unchanged, so
+        programming errors and unrelated failures surface normally.
+        Callers get OSError propagation on real send failure.
+        """
         _LOGGER.debug("[%s] Sending data: %s", self.address, data_to_send)
         try:
             await self.socket.send_bytes(str.encode(data_to_send))
-        except Exception as exc:  # pylint: disable=broad-exception-caught
+        except OSError as exc:
             _LOGGER.error("Error sending data: %s", exc)
             self.state = ConnectionState.ERROR
+            raise
 
     async def read_socket(self) -> None:
         """Read data from socket."""
