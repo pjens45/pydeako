@@ -39,6 +39,7 @@ class _SocketConnection:
         self.sock.setblocking(False)
         _LOGGER.info("Connecting to %s", self.address)
         address, port = self.address.split(":")
+        # split() returns strings; sock_connect() expects an integer port.
         await self.loop.sock_connect(self.sock, (address, int(port)))
 
     def close_socket(self) -> None:

@@ -34,8 +34,7 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 # Bridge TCP port used by `_tcp_probe`. The protocol layer parses
 # "ip:port" address strings in utils/_socket.py and exposes no
-# shared port constant, so the pool owns this value at module
-# scope per section 7.
+# shared port constant, so the pool owns this value at module scope.
 DEAKO_DEFAULT_PORT = 23
 
 # Upper bound on waiting for a concurrent switch to complete.
@@ -67,10 +66,11 @@ async def _tcp_probe(
     """Bounded TCP reachability check. Module-private.
 
     Returns True iff a TCP connection to ``host:port`` could be
-    established within ``timeout`` seconds. This is a reachability
-    probe, not a readiness proof; a bridge that answers here may
-    still reject the application-level handshake. Callers follow
-    this with `_connect_primary` as the readiness gate.
+    established within ``timeout`` seconds. A successful TCP accept
+    only proves the port is open—it does not guarantee the bridge is
+    ready to speak the Deako protocol. Callers follow this with
+    ``Deako.connect()`` + ``find_devices()`` (via ``_connect_primary``)
+    as the real readiness gate.
     """
     try:
         _, writer = await asyncio.wait_for(
@@ -98,8 +98,8 @@ class _KeepAliveSocket:
     socket open to the current standby bridge so the bridge is
     warm the instant a failover runs.
 
-    `start()` and `stop()` are both awaitable (decision 24). All
-    pool-level callers wrap `stop()` in
+    `start()` and `stop()` are both awaitable. All pool-level
+    callers wrap `stop()` in
     `asyncio.wait_for(..., timeout=STEP_TIMEOUT_S)` after
     checking that the pool's keepalive reference is non-None.
     """
@@ -118,8 +118,8 @@ class _KeepAliveSocket:
         """Open the keepalive socket.
 
         Raises OSError on connect failure. Pool-level callers treat
-        that failure as non-fatal per decision 27: log WARNING and
-        proceed with `self._keepalive = None`.
+        that failure as non-fatal: log WARNING and proceed with
+        `self._keepalive = None`.
         """
         loop = asyncio.get_running_loop()
         sock = _SocketConnection(self._address, loop)
@@ -152,7 +152,7 @@ class _KeepAliveSocket:
 
 @dataclass(frozen=True)
 class ConnectionPoolState:
-    """Immutable snapshot of the pool's state (decision 23).
+    """Immutable snapshot of the pool's state.
 
     Exactly five fields. Pull-only via `DeakoConnectionPool.state()`.
     `primary_host` and `failover_host` are `str` for the lifetime
@@ -170,18 +170,18 @@ class ConnectionPoolState:
 class DeakoConnectionPool:
     """Primary-failover connection pool for Deako bridges.
 
-    Recovery is caller-driven (decision 19): there is no background
-    health monitor. A failed send on the active primary triggers
-    exactly one `_switch_to_failover` attempt inside the same
-    `control_device` call, plus one retry on the new active. Once
-    the pool enters a degraded state (no connected active), the
-    next `control_device` call runs `_attempt_recovery` which tries
-    both hosts in deterministic order and raises
-    `NoSocketException` with a host-annotated message on failure.
+    Recovery is caller-driven: there is no background health monitor.
+    A failed send on the active primary triggers exactly one
+    `_switch_to_failover` attempt inside the same `control_device`
+    call, plus one retry on the new active. Once the pool enters a
+    degraded state (no connected active), the next `control_device`
+    call runs `_attempt_recovery` which tries both hosts in
+    deterministic order and raises `NoSocketException` with a
+    host-annotated message on failure.
 
-    `stop()` is terminal (decision 22). Calling `start()` after
-    `stop()` raises `RuntimeError`. `control_device()` after
-    `stop()` raises `NoSocketException`.
+    `stop()` is terminal. Calling `start()` after `stop()` raises
+    `RuntimeError`. `control_device()` after `stop()` raises
+    `NoSocketException`.
 
     State callbacks registered via `set_state_callback` are stored
     on the pool itself and replayed onto the new active `Deako`
@@ -216,8 +216,7 @@ class DeakoConnectionPool:
 
         Concurrent `start()` calls on the same pool are unsupported:
         callers must serialize setup. Home Assistant's single-thread
-        async setup satisfies this naturally. This PR does not add a
-        start-lock (decision 9).
+        async setup satisfies this naturally.
         """
         if primary_host == failover_host:
             raise ValueError(
@@ -233,11 +232,11 @@ class DeakoConnectionPool:
         self.active: Deako | None = None
         self._keepalive: _KeepAliveSocket | None = None
 
-        # Pool-owned callback registry (decision 7). Replayed onto
-        # the new active after every successful switch / recovery.
+        # Pool-owned callback registry. Replayed onto the new active
+        # after every successful switch / recovery.
         self._state_callbacks: dict[str, Callable[[], None]] = {}
 
-        # Switch serialization primitives (decision 6 and 20).
+        # Switch serialization primitives.
         self._switch_lock: asyncio.Lock = asyncio.Lock()
         self._switch_event: asyncio.Event = asyncio.Event()
         self._switch_event.set()
@@ -279,8 +278,8 @@ class DeakoConnectionPool:
     def is_connected(self) -> bool:
         """Return True iff the active primary is currently connected.
 
-        Uses `Deako.is_connected()` (decision 21) so the pool does
-        not reach through the manager to check socket state.
+        Uses `Deako.is_connected()` so the pool does not reach
+        through manager internals to check socket state.
         """
         return self.active is not None and self.active.is_connected()
 
@@ -295,8 +294,7 @@ class DeakoConnectionPool:
         onto the new active `Deako` after every successful failover
         switch or recovery, so user callbacks survive bridge swaps
         without re-registration. Callback shape matches
-        `Deako.set_state_callback` (decision 10): sync only, zero
-        arguments. Async callbacks are not supported in this PR.
+        `Deako.set_state_callback`: sync only, zero arguments.
         """
         self._state_callbacks[uuid] = callback
         if self.active is not None:
@@ -345,17 +343,17 @@ class DeakoConnectionPool:
 
         Fail-fast: raises `NoSocketException` if the primary cannot
         be reached. A best-effort `_KeepAliveSocket` is then started
-        on `failover_host`; keepalive failure is non-fatal per
-        decision 27 and leaves `self._keepalive = None`.
+        on `failover_host`; keepalive failure is non-fatal and leaves
+        `self._keepalive = None`.
 
         Idempotent after first success: a subsequent `start()` on
         an already-started pool is a no-op. A failed initial
         `start()` leaves the pool unstarted (`_started=False`,
         `active=None`, `_keepalive=None`) so a later retry can
         succeed normally. `start()` after `stop()` raises
-        `RuntimeError` (decision 22); the pool is single-use.
+        `RuntimeError`; the pool is single-use.
 
-        Concurrent `start()` calls are unsupported (decision 9).
+        Concurrent `start()` calls are unsupported.
         """
         if self._stopped:
             raise RuntimeError(
@@ -374,10 +372,10 @@ class DeakoConnectionPool:
                 f"start: primary {self.primary_host} unreachable: "
                 f"{exc}",
             ) from exc
-        # Post-await stopped re-check (decision 22). If stop() ran
-        # while the long connect was in flight, discard the freshly
-        # connected Deako rather than installing it on a pool the
-        # caller has already terminated.
+        # Post-await stopped re-check. If stop() ran while the long
+        # connect was in flight, discard the freshly connected Deako
+        # rather than installing it on a pool the caller has already
+        # terminated.
         if self._stopped:
             try:
                 await asyncio.wait_for(
@@ -392,13 +390,12 @@ class DeakoConnectionPool:
                 )
             return
         # Primary is live. Latch started BEFORE best-effort keepalive
-        # so a keepalive failure does not un-set it (decision 9 and
-        # decision 27 combined).
+        # so a keepalive failure does not un-set it.
         self.active = new_active
         self._started = True
         # Replay any callbacks that were registered before start().
         self._replay_callbacks(new_active)
-        # Best-effort warm standby on failover_host per decision 27.
+        # Best-effort warm standby on failover_host.
         try:
             await self._start_keepalive(self.failover_host)
         except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -410,16 +407,16 @@ class DeakoConnectionPool:
             self._keepalive = None
 
     async def stop(self) -> None:
-        """Terminal shutdown. Re-entrant-safe (decision 22).
+        """Terminal shutdown. Re-entrant-safe.
 
         Sets `_stopped=True` first so any in-flight switch method
         sees it on its next await boundary and bails out. Sets
         `_switch_event` to unblock any waiters. Then tears down
         the keepalive and the active connection under
-        `asyncio.wait_for(..., timeout=STEP_TIMEOUT_S)` with the
-        unified WARNING wording from decision 24. Each teardown is
-        None-guarded because `stop()` may run before `start()`
-        completed, after a failed recovery, or mid-partial-connect.
+        `asyncio.wait_for(..., timeout=STEP_TIMEOUT_S)`. Each
+        teardown is None-guarded because `stop()` may run before
+        `start()` completed, after a failed recovery, or
+        mid-partial-connect.
         """
         if self._stopped:
             return
@@ -472,8 +469,7 @@ class DeakoConnectionPool:
         for calling `_cleanup_partial_connect` on the partial
         object if one was created. This method never mutates pool
         state beyond returning the new `Deako`; the caller
-        installs it on `self.active` only after success (decision
-        14 host-swap invariant).
+        installs it on `self.active` only after success.
         """
         port = DEAKO_DEFAULT_PORT
         address = f"{host}:{port}"
@@ -535,8 +531,8 @@ class DeakoConnectionPool:
 
         Stores the result in `self._keepalive` on success. Raises
         on failure; all pool-level callers wrap the call in
-        `try/except Exception` per decision 27 and set
-        `self._keepalive = None` on failure.
+        `try/except Exception` and set `self._keepalive = None`
+        on failure.
         """
         keepalive = _KeepAliveSocket(host)
         await keepalive.start()
@@ -609,13 +605,13 @@ class DeakoConnectionPool:
     ) -> bool:
         """Switch the active connection to the failover bridge.
 
-        Section 7.2 contract. Called from the `on_connection_lost`
-        path and from the `control_device` hot-failover path
-        (section 7.4) with `failed_host = self.primary_host`.
+        Called from the `on_connection_lost` path and from the
+        `control_device` hot-failover path with
+        `failed_host = self.primary_host`.
 
         Returns True on success, False on any failure (host not
         ready, connect exhausted, stopped mid-flight). The host
-        map is only mutated on the success branch (decision 14).
+        map is only mutated on the success branch.
 
         The concurrent-caller path waits on `_switch_event` up to
         `SWITCH_WAIT_TIMEOUT_S`; if `failed_host` is None, success
@@ -651,11 +647,10 @@ class DeakoConnectionPool:
                 # Step 4: stopped check.
                 if self._stopped:
                     return False
-                # Step 6: release warm-standby keepalive. The pool's
-                # own keepalive lives on failover_host, and we are
-                # about to connect there; without this it fights us
-                # for the single TCP slot on that bridge. None-guard
-                # is defensive per section 7.2 note.
+                # Release the standby keepalive before connecting.
+                # The bridge only accepts one TCP session, so the
+                # keepalive must be dropped first or it blocks the
+                # real Deako connection to the failover host.
                 if self._keepalive is not None:
                     try:
                         await asyncio.wait_for(
@@ -703,10 +698,10 @@ class DeakoConnectionPool:
                         "switch: connect_exhausted on %s", target,
                     )
                     return False
-                # Step 11: post-await stopped re-check (decision 22).
-                # If stop() ran while _connect_with_retry was in
-                # flight, discard the freshly connected Deako and
-                # bail without mutating the host map.
+                # Post-await stopped re-check. If stop() ran while
+                # _connect_with_retry was in flight, discard the
+                # freshly connected Deako and bail without mutating
+                # the host map.
                 if self._stopped:
                     try:
                         await asyncio.wait_for(
@@ -773,7 +768,7 @@ class DeakoConnectionPool:
     def _fire_on_failover_switch(self) -> None:
         """Invoke the user switch callback, swallowing errors.
 
-        Sync-only per decision 10. Callback errors are logged at
+        Sync-only. Callback errors are logged at
         WARNING so they never destabilize the pool.
         """
         if self._on_failover_switch is None:
@@ -793,13 +788,12 @@ class DeakoConnectionPool:
     ) -> tuple[bool, dict[str, str]]:
         """Two-host recovery path used only by the no-primary send.
 
-        Section 7.3 contract. Returns `(True, {})` on success and
-        `(False, reasons)` on failure, where `reasons` maps each
-        host to its last reason token (`tcp_probe_failed`,
-        `connect_exhausted`, `stopped`, `switch_wait_timeout`, or
-        `in_flight_switch_failed`). The section 7.5 message
-        builder uses the reasons dict to name the hosts and their
-        failure causes in the raised `NoSocketException`.
+        Returns `(True, {})` on success and `(False, reasons)` on
+        failure, where `reasons` maps each host to its last reason
+        token (`tcp_probe_failed`, `connect_exhausted`, `stopped`,
+        `switch_wait_timeout`, or `in_flight_switch_failed`).
+        `_ensure_primary_or_raise` uses the reasons dict to build
+        the host-annotated `NoSocketException` message.
 
         Probe order is deterministic: `self.primary_host` first,
         `self.failover_host` second. The winner becomes the new
@@ -813,7 +807,7 @@ class DeakoConnectionPool:
                 self.failover_host: token,
             }
 
-        # Concurrent-caller path per section 7.3.
+        # Concurrent-caller path.
         if self._switch_lock.locked():
             try:
                 await asyncio.wait_for(
@@ -834,9 +828,9 @@ class DeakoConnectionPool:
             try:
                 if self._stopped:
                     return False, _fill_both("stopped")
-                # Decision 28: disconnect any stale half-dead
-                # `self.active` before probing so it cannot
-                # compete with the new connection.
+                # Disconnect any stale half-dead `self.active`
+                # before probing so it cannot compete with the
+                # new connection.
                 if self.active is not None:
                     try:
                         await asyncio.wait_for(
@@ -850,9 +844,9 @@ class DeakoConnectionPool:
                             STEP_TIMEOUT_S,
                         )
                     self.active = None
-                # Decision 26: release the warm-standby keepalive
-                # before any probe so recovery does not fight its
-                # own socket on failover_host.
+                # Release the standby keepalive before probing. The
+                # bridge only accepts one TCP session, so recovery
+                # must not fight its own keepalive socket.
                 if self._keepalive is not None:
                     try:
                         await asyncio.wait_for(
@@ -886,10 +880,10 @@ class DeakoConnectionPool:
                             return False, _fill_both("stopped")
                         reasons[target] = "connect_exhausted"
                         continue
-                    # Post-await stopped re-check (decision 22). If
-                    # stop() ran while _connect_with_retry was in
-                    # flight, discard the freshly connected Deako
-                    # and bail without mutating the host map.
+                    # Post-await stopped re-check. If stop() ran
+                    # while _connect_with_retry was in flight,
+                    # discard the freshly connected Deako and bail
+                    # without mutating the host map.
                     if self._stopped:
                         try:
                             await asyncio.wait_for(
@@ -938,9 +932,9 @@ class DeakoConnectionPool:
     # ----- control_device send path ----------------------------
 
     async def _ensure_primary_or_raise(self) -> None:
-        """Section 7.5: if no connected primary, run recovery.
+        """If no connected primary, run recovery.
 
-        Raises `NoSocketException` with the decision-25 message
+        Raises `NoSocketException` with a host-annotated message
         on recovery failure. Called from `control_device` when
         `self.active` is None or not connected.
         """
@@ -969,10 +963,9 @@ class DeakoConnectionPool:
     ) -> None:
         """Send a device control command through the active pool.
 
-        Section 7.4 hot-failover path plus section 7.5 no-primary
-        path. The pool calls `Deako._control_device_strict` (not
-        the public `control_device`) so it sees the raising
-        contract from decision 29 and can drive failover.
+        The pool calls `Deako._control_device_strict` (not the
+        public `control_device`) so send failures raise instead
+        of being swallowed, letting the pool drive failover.
 
         On `OSError` or `NoSocketException` from the active send,
         performs exactly one `_switch_to_failover(failed_host=
@@ -980,12 +973,12 @@ class DeakoConnectionPool:
         send on the new active. If the switch returns False, or
         the retry raises, raises `NoSocketException` naming the
         host(s) attempted. Does not cascade into
-        `_attempt_recovery`; the next call enters section 7.5 and
-        runs recovery naturally.
+        `_attempt_recovery`; the next call enters the no-primary
+        path and runs recovery naturally.
         """
         if self._stopped:
             raise NoSocketException("pool stopped")
-        # Section 7.5: no connected primary -> run recovery.
+        # No connected primary -> run recovery.
         if (
             self.active is None
             or not self.active.is_connected()
@@ -1001,7 +994,7 @@ class DeakoConnectionPool:
             )
             return
         except OSError:
-            # NoSocketException subclasses OSError per decision 17.
+            # NoSocketException subclasses OSError.
             _LOGGER.warning(
                 "control_device send failed on active primary "
                 "%s; switching to failover",

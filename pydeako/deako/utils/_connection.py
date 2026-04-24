@@ -60,11 +60,12 @@ class _Connection:
     async def send_data(self, data_to_send: str) -> None:
         """Send data to socket.
 
-        Narrow catch: only OSError (which includes NoSocketException
-        via its OSError inheritance) is caught to flip state to ERROR
-        before re-raising. Other exceptions propagate unchanged, so
-        programming errors and unrelated failures surface normally.
-        Callers get OSError propagation on real send failure.
+        On send failure, state must flip to ERROR immediately so the
+        rest of the state machine (and higher-level callers like the
+        pool) see the failure without polling. The ``except OSError``
+        is intentionally narrow: TypeError, AttributeError, and other
+        programming errors should propagate as bugs, not be converted
+        into connection-state changes.
         """
         _LOGGER.debug("[%s] Sending data: %s", self.address, data_to_send)
         try:

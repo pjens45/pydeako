@@ -208,8 +208,7 @@ class _Manager:
 
         Returns True on successful enqueue, False only when there is no
         active connection. OSError from a real send failure propagates
-        to the caller so failover / the pool can act on it, per the
-        decision-17 send-failure contract.
+        to the caller so failover / the pool can act on it.
         """
         return await self.send_request(
             _Request(

@@ -212,14 +212,15 @@ class Deako:
     ) -> None:
         """Add control request to queue.
 
-        Preserves 0.x external behavior per decision 29: any send
-        failure (no active connection, or OSError from the socket
-        layer) is caught here, logged at DEBUG, and swallowed so
-        HA callers see no observable change. The tuple
-        `(OSError, NoSocketException)` is retained deliberately
-        for explicitness even though NoSocketException is an
-        OSError subclass. Non-matching exceptions propagate
-        unchanged so programming errors remain visible.
+        Preserves existing public behavior: any send failure (no
+        active connection, or OSError from the socket layer) is
+        caught here, logged at DEBUG, and swallowed so HA callers
+        see no observable change. `_control_device_strict()` is
+        the raising path the pool uses to drive failover. The
+        tuple `(OSError, NoSocketException)` is retained for
+        explicitness even though NoSocketException is an OSError
+        subclass. Non-matching exceptions propagate unchanged so
+        programming errors remain visible.
         """
         try:
             await self._control_device_strict(uuid, power, dim)
