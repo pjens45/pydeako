@@ -376,18 +376,7 @@ class DeakoConnectionPool:
         # connect was in flight, discard the freshly connected Deako
         # rather than installing it on a pool the caller has already
         # terminated.
-        if self._stopped:
-            try:
-                await asyncio.wait_for(
-                    new_active.disconnect(),
-                    timeout=STEP_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "active.disconnect() timed out after %ss; "
-                    "proceeding",
-                    STEP_TIMEOUT_S,
-                )
+        if await self._discard_if_stopped(new_active):
             return
         # Primary is live. Latch started BEFORE best-effort keepalive
         # so a keepalive failure does not un-set it.
@@ -564,6 +553,59 @@ class DeakoConnectionPool:
         except asyncio.TimeoutError:
             return False
 
+    async def _discard_if_stopped(self, deako: Deako) -> bool:
+        """If the pool is stopped, disconnect ``deako`` and return True.
+
+        Used after an async connect returns to check whether stop()
+        ran while the connect was in flight. If so, the freshly
+        connected Deako is disconnected rather than installed.
+        """
+        if not self._stopped:
+            return False
+        try:
+            await asyncio.wait_for(
+                deako.disconnect(), timeout=STEP_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "active.disconnect() timed out after %ss; "
+                "proceeding",
+                STEP_TIMEOUT_S,
+            )
+        return True
+
+    async def _teardown_keepalive(self) -> None:
+        """Stop and clear the keepalive socket with bounded timeout."""
+        if self._keepalive is not None:
+            try:
+                await asyncio.wait_for(
+                    self._keepalive.stop(),
+                    timeout=STEP_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "keepalive.stop() timed out after %ss; "
+                    "proceeding",
+                    STEP_TIMEOUT_S,
+                )
+            self._keepalive = None
+
+    async def _teardown_active(self) -> None:
+        """Disconnect and clear the active Deako with bounded timeout."""
+        if self.active is not None:
+            try:
+                await asyncio.wait_for(
+                    self.active.disconnect(),
+                    timeout=STEP_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "active.disconnect() timed out after %ss; "
+                    "proceeding",
+                    STEP_TIMEOUT_S,
+                )
+            self.active = None
+
     # ----- on_connection_lost hook -----------------------------
 
     def _on_active_connection_lost(self) -> None:
@@ -599,7 +641,67 @@ class DeakoConnectionPool:
 
     # ----- Switch and recovery ---------------------------------
 
-    # pylint: disable-next=too-many-return-statements,too-many-branches
+    async def _wait_for_in_flight_switch(
+        self, failed_host: str | None,
+    ) -> bool | None:
+        """Wait for an already-running switch to finish.
+
+        Returns the result (bool) if a switch was in flight, or
+        None if the lock was free and the caller should proceed.
+        """
+        if not self._switch_lock.locked():
+            return None
+        try:
+            await asyncio.wait_for(
+                self._switch_event.wait(),
+                timeout=SWITCH_WAIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            return False
+        if failed_host is None:
+            return (
+                self.active is not None
+                and self.active.is_connected()
+            )
+        return self.primary_host != failed_host
+
+    async def _execute_failover_switch(self) -> bool:
+        """Core failover logic after guards pass. Lock must be held.
+
+        Tears down the current keepalive and active, waits for the
+        failover host to accept TCP, connects with retry, and
+        installs the new active on success.
+        """
+        # Release the standby keepalive before connecting. The
+        # bridge only accepts one TCP session, so the keepalive
+        # must be dropped first or it blocks the real Deako
+        # connection to the failover host.
+        await self._teardown_keepalive()
+        await self._teardown_active()
+        if self._stopped:
+            return False
+        target = self.failover_host
+        ready = await self._wait_ready(
+            target, timeout=BRIDGE_RECYCLE_TIMEOUT_S,
+        )
+        if not ready:
+            _LOGGER.warning(
+                "switch: host_not_ready on %s", target,
+            )
+            return False
+        new_active = await self._connect_with_retry(target)
+        if new_active is None:
+            _LOGGER.warning(
+                "switch: connect_exhausted on %s", target,
+            )
+            return False
+        if await self._discard_if_stopped(new_active):
+            return False
+        await self._install_new_active(
+            target, new_active, "failover switch",
+        )
+        return True
+
     async def _switch_to_failover(
         self, failed_host: str | None,
     ) -> bool:
@@ -619,128 +721,23 @@ class DeakoConnectionPool:
         otherwise by whether the primary has moved off
         `failed_host`.
         """
-        # Step 1: concurrent-caller path.
-        if self._switch_lock.locked():
-            try:
-                await asyncio.wait_for(
-                    self._switch_event.wait(),
-                    timeout=SWITCH_WAIT_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                return False
-            if failed_host is None:
-                return (
-                    self.active is not None
-                    and self.active.is_connected()
-                )
-            return self.primary_host != failed_host
+        in_flight = await self._wait_for_in_flight_switch(
+            failed_host,
+        )
+        if in_flight is not None:
+            return in_flight
 
         async with self._switch_lock:
             self._switch_event.clear()
             try:
-                # Step 3: stale-host guard.
                 if (
                     failed_host is not None
                     and failed_host != self.primary_host
                 ):
                     return True
-                # Step 4: stopped check.
                 if self._stopped:
                     return False
-                # Release the standby keepalive before connecting.
-                # The bridge only accepts one TCP session, so the
-                # keepalive must be dropped first or it blocks the
-                # real Deako connection to the failover host.
-                if self._keepalive is not None:
-                    try:
-                        await asyncio.wait_for(
-                            self._keepalive.stop(),
-                            timeout=STEP_TIMEOUT_S,
-                        )
-                    except asyncio.TimeoutError:
-                        _LOGGER.warning(
-                            "keepalive.stop() timed out after %ss;"
-                            " proceeding",
-                            STEP_TIMEOUT_S,
-                        )
-                    self._keepalive = None
-                # Step 7: disconnect the failed active.
-                if self.active is not None:
-                    try:
-                        await asyncio.wait_for(
-                            self.active.disconnect(),
-                            timeout=STEP_TIMEOUT_S,
-                        )
-                    except asyncio.TimeoutError:
-                        _LOGGER.warning(
-                            "active.disconnect() timed out after"
-                            " %ss; proceeding",
-                            STEP_TIMEOUT_S,
-                        )
-                    self.active = None
-                # Step 8: stopped check.
-                if self._stopped:
-                    return False
-                # Step 9: wait for failover host to accept TCP.
-                target = self.failover_host
-                ready = await self._wait_ready(
-                    target, timeout=BRIDGE_RECYCLE_TIMEOUT_S,
-                )
-                if not ready:
-                    _LOGGER.warning(
-                        "switch: host_not_ready on %s", target,
-                    )
-                    return False
-                # Step 10: bounded connect-with-retry.
-                new_active = await self._connect_with_retry(target)
-                if new_active is None:
-                    _LOGGER.warning(
-                        "switch: connect_exhausted on %s", target,
-                    )
-                    return False
-                # Post-await stopped re-check. If stop() ran while
-                # _connect_with_retry was in flight, discard the
-                # freshly connected Deako and bail without mutating
-                # the host map.
-                if self._stopped:
-                    try:
-                        await asyncio.wait_for(
-                            new_active.disconnect(),
-                            timeout=STEP_TIMEOUT_S,
-                        )
-                    except asyncio.TimeoutError:
-                        _LOGGER.warning(
-                            "active.disconnect() timed out after"
-                            " %ss; proceeding",
-                            STEP_TIMEOUT_S,
-                        )
-                    return False
-                # Step 12: success. Swap host map, install new
-                # active, replay callbacks, start keepalive best
-                # effort on the former primary.
-                old_primary = self.primary_host
-                self.primary_host = target
-                self.failover_host = old_primary
-                self.active = new_active
-                self._replay_callbacks(new_active)
-                try:
-                    await self._start_keepalive(self.failover_host)
-                # pylint: disable-next=broad-exception-caught
-                except Exception as exc:
-                    _LOGGER.warning(
-                        "keepalive start on %s failed after "
-                        "switch: %s; pool proceeds without warm "
-                        "standby",
-                        self.failover_host, exc,
-                    )
-                    self._keepalive = None
-                _LOGGER.info(
-                    "failover switch succeeded: primary=%s "
-                    "failover=%s",
-                    self.primary_host, self.failover_host,
-                )
-                self._fire_on_failover_switch()
-                return True
+                return await self._execute_failover_switch()
             finally:
                 self._switch_event.set()
 
@@ -782,7 +779,104 @@ class DeakoConnectionPool:
                 "on_failover_switch callback error: %s", exc,
             )
 
-    # pylint: disable-next=too-many-return-statements,too-many-branches,too-many-statements
+    async def _install_new_active(
+        self, target: str, new_active: Deako, context: str,
+    ) -> None:
+        """Install a freshly connected Deako as the active.
+
+        Swaps the host roles so ``target`` becomes the new primary,
+        replays stored callbacks onto ``new_active``, and starts a
+        best-effort keepalive on the other host. ``context`` labels
+        log messages (e.g. ``"failover switch"`` or ``"recovery"``).
+        """
+        other = (
+            self.failover_host
+            if target == self.primary_host
+            else self.primary_host
+        )
+        self.primary_host = target
+        self.failover_host = other
+        self.active = new_active
+        self._replay_callbacks(new_active)
+        try:
+            await self._start_keepalive(other)
+        # pylint: disable-next=broad-exception-caught
+        except Exception as exc:
+            _LOGGER.warning(
+                "keepalive start on %s failed after "
+                "%s: %s; pool proceeds without warm "
+                "standby",
+                other, context, exc,
+            )
+            self._keepalive = None
+        _LOGGER.info(
+            "%s succeeded: primary=%s failover=%s",
+            context, self.primary_host, self.failover_host,
+        )
+        self._fire_on_failover_switch()
+
+    def _fill_both_reasons(
+        self, token: str,
+    ) -> dict[str, str]:
+        """Map both hosts to the same reason token."""
+        return {
+            self.primary_host: token,
+            self.failover_host: token,
+        }
+
+    async def _wait_for_in_flight_recovery(
+        self,
+    ) -> tuple[bool, dict[str, str]] | None:
+        """Wait for an already-running switch/recovery to finish.
+
+        Returns ``(bool, reasons)`` if a switch was in flight, or
+        None if the lock was free and the caller should proceed.
+        """
+        if not self._switch_lock.locked():
+            return None
+        try:
+            await asyncio.wait_for(
+                self._switch_event.wait(),
+                timeout=SWITCH_WAIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            return False, self._fill_both_reasons(
+                "switch_wait_timeout",
+            )
+        if (
+            self.active is not None
+            and self.active.is_connected()
+        ):
+            return True, {}
+        return False, self._fill_both_reasons(
+            "in_flight_switch_failed",
+        )
+
+    async def _try_recovery_candidate(
+        self, target: str,
+    ) -> bool | str:
+        """Probe and connect to a single candidate during recovery.
+
+        Returns True on success (new active installed), False if the
+        pool was stopped mid-attempt, or a reason-token string on
+        failure (``"tcp_probe_failed"`` or ``"connect_exhausted"``).
+        """
+        if not await _tcp_probe(
+            target, DEAKO_DEFAULT_PORT, PROBE_TIMEOUT,
+        ):
+            return "tcp_probe_failed"
+        new_deako = await self._connect_with_retry(target)
+        if new_deako is None:
+            if self._stopped:
+                return False
+            return "connect_exhausted"
+        if await self._discard_if_stopped(new_deako):
+            return False
+        await self._install_new_active(
+            target, new_deako, "recovery",
+        )
+        return True
+
     async def _attempt_recovery(
         self,
     ) -> tuple[bool, dict[str, str]]:
@@ -799,132 +893,41 @@ class DeakoConnectionPool:
         `self.failover_host` second. The winner becomes the new
         active; the loser becomes the warm standby.
         """
-        reasons: dict[str, str] = {}
-
-        def _fill_both(token: str) -> dict[str, str]:
-            return {
-                self.primary_host: token,
-                self.failover_host: token,
-            }
-
-        # Concurrent-caller path.
-        if self._switch_lock.locked():
-            try:
-                await asyncio.wait_for(
-                    self._switch_event.wait(),
-                    timeout=SWITCH_WAIT_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                return False, _fill_both("switch_wait_timeout")
-            if (
-                self.active is not None
-                and self.active.is_connected()
-            ):
-                return True, {}
-            return False, _fill_both("in_flight_switch_failed")
+        in_flight = await self._wait_for_in_flight_recovery()
+        if in_flight is not None:
+            return in_flight
 
         async with self._switch_lock:
             self._switch_event.clear()
             try:
                 if self._stopped:
-                    return False, _fill_both("stopped")
-                # Disconnect any stale half-dead `self.active`
-                # before probing so it cannot compete with the
-                # new connection.
-                if self.active is not None:
-                    try:
-                        await asyncio.wait_for(
-                            self.active.disconnect(),
-                            timeout=STEP_TIMEOUT_S,
-                        )
-                    except asyncio.TimeoutError:
-                        _LOGGER.warning(
-                            "active.disconnect() timed out after"
-                            " %ss; proceeding",
-                            STEP_TIMEOUT_S,
-                        )
-                    self.active = None
-                # Release the standby keepalive before probing. The
-                # bridge only accepts one TCP session, so recovery
-                # must not fight its own keepalive socket.
-                if self._keepalive is not None:
-                    try:
-                        await asyncio.wait_for(
-                            self._keepalive.stop(),
-                            timeout=STEP_TIMEOUT_S,
-                        )
-                    except asyncio.TimeoutError:
-                        _LOGGER.warning(
-                            "keepalive.stop() timed out after %ss;"
-                            " proceeding",
-                            STEP_TIMEOUT_S,
-                        )
-                    self._keepalive = None
-                # Deterministic candidate order.
-                candidates = [
+                    return False, self._fill_both_reasons("stopped")
+                # Disconnect stale active and release keepalive
+                # before probing. The bridge only accepts one TCP
+                # session, so recovery must not fight its own
+                # sockets.
+                await self._teardown_active()
+                await self._teardown_keepalive()
+                reasons: dict[str, str] = {}
+                for target in [
                     self.primary_host, self.failover_host,
-                ]
-                for target in candidates:
+                ]:
                     if self._stopped:
-                        return False, _fill_both("stopped")
-                    if not await _tcp_probe(
-                        target, DEAKO_DEFAULT_PORT, PROBE_TIMEOUT,
-                    ):
-                        reasons[target] = "tcp_probe_failed"
-                        continue
-                    new_deako = await self._connect_with_retry(
+                        return (
+                            False,
+                            self._fill_both_reasons("stopped"),
+                        )
+                    result = await self._try_recovery_candidate(
                         target,
                     )
-                    if new_deako is None:
-                        if self._stopped:
-                            return False, _fill_both("stopped")
-                        reasons[target] = "connect_exhausted"
-                        continue
-                    # Post-await stopped re-check. If stop() ran
-                    # while _connect_with_retry was in flight,
-                    # discard the freshly connected Deako and bail
-                    # without mutating the host map.
-                    if self._stopped:
-                        try:
-                            await asyncio.wait_for(
-                                new_deako.disconnect(),
-                                timeout=STEP_TIMEOUT_S,
-                            )
-                        except asyncio.TimeoutError:
-                            _LOGGER.warning(
-                                "active.disconnect() timed out "
-                                "after %ss; proceeding",
-                                STEP_TIMEOUT_S,
-                            )
-                        return False, _fill_both("stopped")
-                    # Success on this target.
-                    self.active = new_deako
-                    self._replay_callbacks(new_deako)
-                    other = (
-                        self.failover_host
-                        if target == self.primary_host
-                        else self.primary_host
-                    )
-                    self.primary_host = target
-                    self.failover_host = other
-                    try:
-                        await self._start_keepalive(other)
-                    # pylint: disable-next=broad-exception-caught
-                    except Exception as exc:
-                        _LOGGER.warning(
-                            "keepalive start on %s failed after "
-                            "recovery: %s; pool proceeds without "
-                            "warm standby",
-                            other, exc,
+                    if result is True:
+                        return True, {}
+                    if result is False:
+                        return (
+                            False,
+                            self._fill_both_reasons("stopped"),
                         )
-                        self._keepalive = None
-                    _LOGGER.info(
-                        "recovery succeeded: primary=%s "
-                        "failover=%s",
-                        self.primary_host, self.failover_host,
-                    )
-                    self._fire_on_failover_switch()
-                    return True, {}
+                    reasons[target] = result
                 return False, reasons
             finally:
                 self._switch_event.set()
