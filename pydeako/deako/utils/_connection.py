@@ -69,7 +69,7 @@ class _Connection:
         """
         _LOGGER.debug("[%s] Sending data: %s", self.address, data_to_send)
         try:
-            await self.socket.send_bytes(str.encode(data_to_send))
+            await self.socket.send_bytes(str.encode(data_to_send + "\r\n"))
         except OSError as exc:
             _LOGGER.error("Error sending data: %s", exc)
             self.state = ConnectionState.ERROR

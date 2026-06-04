@@ -47,7 +47,7 @@ async def test_send_data_happy_path(
     bytes reach the socket layer.
     """
     data = str(uuid4())
-    data_bytes = str.encode(data)
+    data_bytes = str.encode(data + "\r\n")
     address, name = Mock(), Mock()
     loop_mock = Mock()
     asyncio_mock.get_running_loop.return_value = loop_mock
@@ -83,7 +83,7 @@ async def test_send_data_reraises_oserror(
     it. Other exceptions are not covered here (see other tests).
     """
     data = str(uuid4())
-    data_bytes = str.encode(data)
+    data_bytes = str.encode(data + "\r\n")
     address, name = Mock(), Mock()
     loop_mock = Mock()
     asyncio_mock.get_running_loop.return_value = loop_mock
@@ -121,7 +121,7 @@ async def test_send_data_reraises_nosocketexception(
     re-raises it. State flips to ERROR.
     """
     data = str(uuid4())
-    data_bytes = str.encode(data)
+    data_bytes = str.encode(data + "\r\n")
     address, name = Mock(), Mock()
     loop_mock = Mock()
     asyncio_mock.get_running_loop.return_value = loop_mock
