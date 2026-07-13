@@ -148,6 +148,9 @@ class Deako:
     ) -> None:
         """Request the device list."""
         _LOGGER.info("Finding devices")
+        # Reset the announced count so a refresh on a live object
+        # cannot inherit a stale value from a previous call.
+        self.expected_devices = 0
         success = await self.connection_manager.send_get_device_list()
         if not success:
             raise FindDevicesError("Failed to send device list request")
@@ -167,7 +170,12 @@ class Deako:
             )
 
         remaining = self.expected_devices * DEVICE_FOUND_TIME_FACTOR_S
-        while len(self.devices) != self.expected_devices and remaining > 0:
+        # `<` on purpose: the bridge's announced count can lag reality
+        # after a profile change (added switches overshoot the count;
+        # an overshoot must count as success, not spin out the
+        # timeout). Undershoot resolves below with a warning instead
+        # of an error.
+        while len(self.devices) < self.expected_devices and remaining > 0:
             _LOGGER.debug(
                 "waiting for devices... expected: %i, received: "
                 + "%i, time remaining: %is",
@@ -179,11 +187,21 @@ class Deako:
             remaining -= DEVICE_FOUND_POLLING_INTERVAL_S
         _LOGGER.debug("found %i devices", len(self.devices))
 
-        if len(self.devices) != self.expected_devices and remaining == 0:
+        if len(self.devices) == 0:
             raise FindDevicesError(
                 f"Timed out waiting for devices to be found. Expected "
-                f"{self.expected_devices} devices but only found "
-                f"{len(self.devices)}",
+                f"{self.expected_devices} devices but found none",
+            )
+        if len(self.devices) < self.expected_devices:
+            # Partial delivery: a removed/replaced switch can still be
+            # counted by the bridge while never sending DEVICE_FOUND.
+            # Proceed with the devices that responded rather than
+            # failing the whole connection over profile drift.
+            _LOGGER.warning(
+                "Expected %i devices but only found %i; proceeding "
+                "with the devices that responded",
+                self.expected_devices,
+                len(self.devices),
             )
 
     async def _control_device_strict(

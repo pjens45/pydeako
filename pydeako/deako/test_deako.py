@@ -367,13 +367,21 @@ async def test_find_devices_devices_timeout(asyncio_mock, manager_mock):
     """Test Deako.find_devices times out and raises."""
     deako = Deako(Mock())
 
-    deako.expected_devices = 42
+    # find_devices resets expected_devices at entry, so simulate the
+    # bridge announcing the count in response to the device list request
+    async def announce_count():
+        deako.expected_devices = 42
+        return True
+
+    manager_mock.return_value.send_get_device_list.side_effect = (
+        announce_count
+    )
     with pytest.raises(FindDevicesError) as exc:
         await deako.find_devices()
 
     assert str(exc.value) == (
         "Failed to find devices: Timed out waiting for devices to be found. "
-        "Expected 42 devices but only found 0"
+        "Expected 42 devices but found none"
     )
     manager_mock.return_value.send_get_device_list.assert_called_once()
 
@@ -386,7 +394,15 @@ async def test_find_devices(asyncio_mock, manager_mock):
     """Test Deako.find_devices."""
     deako = Deako(Mock())
 
-    deako.expected_devices = 42
+    # find_devices resets expected_devices at entry, so simulate the
+    # bridge announcing the count in response to the device list request
+    async def announce_count():
+        deako.expected_devices = 42
+        return True
+
+    manager_mock.return_value.send_get_device_list.side_effect = (
+        announce_count
+    )
     deako.devices = {}
     for i in range(42):
         deako.devices[str(i)] = i

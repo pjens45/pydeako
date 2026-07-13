@@ -16,6 +16,7 @@ import dataclasses
 import pytest
 from mock import AsyncMock, MagicMock, Mock, patch
 
+from ._deako import FindDevicesError
 from ._connection_pool import (
     BRIDGE_RECYCLE_TIMEOUT_S,
     ConnectionPoolState,
@@ -402,6 +403,31 @@ async def test_failed_start_leaves_pool_unstarted():
     assert s.started is False
     assert s.primary_connected is False
     assert s.failover_keepalive_active is False
+
+
+@pytest.mark.asyncio
+async def test_start_find_devices_error_tears_down_partial():
+    """FindDevicesError after a successful connect must tear down the
+    partial Deako (zombie would hold the bridge's single TCP slot)."""
+    pool = DeakoConnectionPool(
+        primary_host="10.0.0.1", failover_host="10.0.0.2",
+    )
+    zombie = _fake_deako_connected()
+    zombie.find_devices = AsyncMock(
+        side_effect=FindDevicesError("no devices"),
+    )
+    with patch(
+        "pydeako.deako._connection_pool.Deako",
+        return_value=zombie,
+    ):
+        with pytest.raises(FindDevicesError):
+            await pool.start()
+    zombie.disconnect.assert_awaited_once()
+    assert pool.active is None
+    # pylint: disable-next=protected-access
+    assert pool._partial_deako is None
+    # pylint: disable-next=protected-access
+    assert pool._started is False
 
 
 @pytest.mark.asyncio

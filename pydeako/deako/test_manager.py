@@ -82,6 +82,7 @@ async def test_init_connection_timeout_connecting(
     get_address.return_value = address, name
     connection_mock_instance = connection_mock.return_value
     connection_mock_instance.is_connected.return_value = False
+    connection_mock_instance.is_errored.return_value = False
 
     await manager.init_connection()
 
@@ -93,6 +94,34 @@ async def test_init_connection_timeout_connecting(
 
     assert asyncio_mock.sleep.call_count == CONNECTION_TIMEOUT_S
 
+    create_connection_mock.assert_called_once()  # this is the retry
+
+
+@patch("pydeako.deako._manager._Manager.create_connection_task")
+@patch("pydeako.deako._manager._Connection")
+@patch("pydeako.deako._manager.asyncio", autospec=True)
+@pytest.mark.asyncio
+async def test_init_connection_bails_early_on_error(
+    asyncio_mock,
+    connection_mock,
+    create_connection_mock,
+):
+    """A connection that errors ends the poll before the timeout."""
+    address, name = Mock(), Mock()
+    get_address = AsyncMock()
+
+    manager = _Manager(get_address, Mock())
+
+    get_address.return_value = address, name
+    connection_mock_instance = connection_mock.return_value
+    connection_mock_instance.is_connected.return_value = False
+    connection_mock_instance.is_errored.return_value = True
+
+    await manager.init_connection()
+
+    # errored immediately: no poll sleeps burned
+    assert asyncio_mock.sleep.call_count == 0
+    connection_mock_instance.close.assert_called_once()
     create_connection_mock.assert_called_once()  # this is the retry
 
 
@@ -131,18 +160,15 @@ async def test_init_connection(
 
 def test_close():
     """Test _Manager.close."""
-    worker = Mock()
     maintain_worker = Mock()
     connection = Mock()
 
     manager = _Manager(AsyncMock(), Mock())
-    manager.worker = worker
     manager.maintain_worker = maintain_worker
     manager.connection = connection
 
     manager.close()
 
-    worker.cancel.assert_called_once()
     maintain_worker.cancel.assert_called_once()
     connection.close.assert_called_once()
 
@@ -483,6 +509,7 @@ async def test_no_reconnect_when_auto_reconnect_false_connect_timeout(
 
     connection_mock_instance = connection_mock.return_value
     connection_mock_instance.is_connected.return_value = False
+    connection_mock_instance.is_errored.return_value = False
 
     manager = _Manager(get_address, Mock())
     manager.auto_reconnect = False

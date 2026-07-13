@@ -185,6 +185,32 @@ async def test_read_socket(
 @patch(
     "pydeako.deako.utils._connection._SocketConnection", spec=_SocketConnection
 )
+@patch("pydeako.deako.utils._connection._Connection.parse_data")
+@pytest.mark.asyncio
+async def test_read_socket_eof(
+    parse_data_mock, socket_connection_mock, asyncio_mock
+):
+    """Test _Connection.read_socket flips to ERROR on peer EOF (b"")."""
+    address, name = Mock(), Mock()
+    loop_mock = Mock()
+    asyncio_mock.get_running_loop.return_value = loop_mock
+
+    conn = _Connection(address, name, Mock())
+
+    socket_connection_mock_instance = socket_connection_mock.return_value
+    socket_connection_mock_instance.read_bytes.return_value = b""
+
+    await conn.read_socket()
+
+    socket_connection_mock_instance.read_bytes.assert_called_once()
+    parse_data_mock.assert_not_called()
+    assert conn.state == ConnectionState.ERROR
+
+
+@patch("pydeako.deako.utils._connection.asyncio")
+@patch(
+    "pydeako.deako.utils._connection._SocketConnection", spec=_SocketConnection
+)
 def test_parse_data_one_item(socket_connection_mock, asyncio_mock):
     """Test _Connection.parse_data, one message."""
     json_message = {"key": "value"}
@@ -269,6 +295,61 @@ def test_parse_data_partial(socket_connection_mock, asyncio_mock):
             call(json_message),
         ]
     )
+
+
+@patch("pydeako.deako.utils._connection.asyncio")
+@patch(
+    "pydeako.deako.utils._connection._SocketConnection", spec=_SocketConnection
+)
+def test_parse_data_poisoned_buffer_recovery(
+    socket_connection_mock, asyncio_mock
+):
+    """Test parse_data recovers when a garbled fragment poisons the buffer.
+
+    A truncated fragment that never completes must not block delivery
+    of subsequent well-formed messages.
+    """
+    json_message = {"key": "value"}
+    address, name = Mock(), Mock()
+    loop_mock = Mock()
+    on_data_callback = Mock()
+    asyncio_mock.get_running_loop.return_value = loop_mock
+
+    conn = _Connection(address, name, on_data_callback)
+
+    socket_connection_mock.assert_called_once_with(address, loop_mock)
+
+    # a truncated fragment arrives and never completes
+    conn.parse_data(b'{"key": "trunca')
+    on_data_callback.assert_not_called()
+
+    # next full message must still be delivered
+    conn.parse_data(str.encode(json.dumps(json_message)))
+    on_data_callback.assert_called_once_with(json_message)
+    assert conn.message_buffer == ""
+
+
+@patch("pydeako.deako.utils._connection.asyncio")
+@patch(
+    "pydeako.deako.utils._connection._SocketConnection", spec=_SocketConnection
+)
+@pytest.mark.parametrize(
+    "state,expected",
+    [
+        (ConnectionState.NOT_STARTED, False),
+        (ConnectionState.CONNECTED, False),
+        (ConnectionState.ERROR, True),
+        (ConnectionState.CLOSED, True),
+    ],
+)
+def test_is_errored(socket_connection_mock, asyncio_mock, state, expected):
+    """Test _Connection.is_errored."""
+    asyncio_mock.get_running_loop.return_value = Mock()
+
+    conn = _Connection(Mock(), Mock(), Mock())
+    conn.state = state
+
+    assert conn.is_errored() is expected
 
 
 @patch("pydeako.deako.utils._connection.asyncio")

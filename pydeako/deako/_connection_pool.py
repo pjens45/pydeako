@@ -27,7 +27,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
-from ._deako import Deako
+from ._deako import Deako, FindDevicesError
 from .utils._socket import NoSocketException, _SocketConnection
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
@@ -365,6 +365,15 @@ class DeakoConnectionPool:
         # Connect primary first. Failure is fatal to start().
         try:
             new_active = await self._connect_primary(self.primary_host)
+        except FindDevicesError:
+            # connect() succeeded but the device-list exchange failed.
+            # The partial Deako is fully connected with a live ping
+            # worker; it MUST be torn down here or it holds the
+            # bridge's single TCP slot indefinitely (every later
+            # connect to this host then fails) while the pool reports
+            # itself unstarted.
+            await self._cleanup_partial_connect()
+            raise
         except (OSError, NoSocketException) as exc:
             # Leave the pool unstarted so a retry may succeed.
             await self._cleanup_partial_connect()
@@ -419,6 +428,11 @@ class DeakoConnectionPool:
         for task in list(self._on_lost_tasks):
             task.cancel()
         self._on_lost_tasks.clear()
+        # Belt-and-suspenders: a partial connect may have been left
+        # behind by a caller that didn't (or couldn't) clean up after
+        # a raise out of _connect_primary. stop() is the last line of
+        # defense against that zombie holding the bridge's TCP slot.
+        await self._cleanup_partial_connect()
         if self._keepalive is not None:
             try:
                 await asyncio.wait_for(

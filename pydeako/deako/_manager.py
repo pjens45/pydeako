@@ -1,7 +1,7 @@
 """
 Manager to SocketConnection, ensuring that there's always an
-active connection. Uses two workers, one to check connectivity
-through pinging, and one to check for messages to send.
+active connection. Runs one background worker that checks
+connectivity through pinging.
 """
 
 import asyncio
@@ -33,7 +33,6 @@ class _ManagerState:
 
     connecting: bool = False
     canceled: bool = False
-    logged_send_error = False
 
 
 # pylint: disable-next=too-many-instance-attributes
@@ -41,7 +40,6 @@ class _Manager:
     """Manage the socket connection to Deako local integrations."""
 
     maintain_worker: asyncio.Task | None = None
-    worker: asyncio.Task | None = None
     connection: _Connection | None = None
     tasks: set[asyncio.Task]
     client_name: str | None
@@ -93,11 +91,15 @@ class _Manager:
             return
         connection = _Connection(address, name, self.incoming_json)
         timeout = 0
-        while not connection.is_connected() and timeout < CONNECTION_TIMEOUT_S:
+        while (
+            not connection.is_connected()
+            and not connection.is_errored()
+            and timeout < CONNECTION_TIMEOUT_S
+        ):
             await asyncio.sleep(CONNECTED_POLLING_INTERVAL_S)
             timeout += CONNECTED_POLLING_INTERVAL_S
-        if timeout == CONNECTION_TIMEOUT_S:
-            _LOGGER.error("Timeout attempting to connect. Trying again")
+        if not connection.is_connected():
+            _LOGGER.error("Failed to connect. Trying again")
             self.state.connecting = False
             connection.close()
             if self.auto_reconnect:
@@ -122,9 +124,6 @@ class _Manager:
             task.cancel()
         self.tasks.clear()
 
-        if self.worker is not None:
-            self.worker.cancel()
-            self.worker = None
         if self.maintain_worker is not None:
             self.maintain_worker.cancel()
             self.maintain_worker = None
@@ -223,6 +222,7 @@ class _Manager:
         """Send a request."""
         if self.connection is not None:
             await self.connection.send_data(req.get_body_str())
+            req.complete_callback()
             return True
 
         _LOGGER.warning("No connection to send data to")

@@ -84,12 +84,35 @@ class _Connection:
             self.state = ConnectionState.ERROR
             return
 
+        if not data:
+            # Peer closed the connection gracefully (EOF). sock_recv
+            # returns b"" immediately -- and keeps returning it -- on
+            # a half-closed socket, and asyncio's sock_recv resolves
+            # synchronously in that case, so without this check the
+            # run() loop spins with no yield point and blocks the
+            # entire event loop.
+            _LOGGER.warning(
+                "[%s] Connection closed by peer", self.format_name(),
+            )
+            self.state = ConnectionState.ERROR
+            return
+
         self.parse_data(data)
 
     def parse_data(self, data: bytes) -> None:
         """
         Parse incoming bytes into json as expected. Possible to have
         data come in multiple chunks and multiple messages.
+
+        A segment that fails to parse is buffered and retried with
+        the next segment appended (messages can be split across
+        chunks and across delimiters). To keep a garbled or
+        truncated fragment from poisoning the buffer forever --
+        every later message would be appended to it, never parse,
+        and leave the connection deaf until the ping timeout dumps
+        it -- a segment that parses standalone while the combined
+        buffer does not is delivered on its own and the stale
+        buffer prefix is dropped.
         """
         raw_string = data.decode("utf-8")
         _LOGGER.debug(
@@ -104,8 +127,27 @@ class _Connection:
                 message_json = json.loads(self.message_buffer)
                 self.on_data_callback(message_json)
                 self.message_buffer = ""
+                continue
             except json.decoder.JSONDecodeError:
-                _LOGGER.debug("Got partial message: %s", self.message_buffer)
+                pass
+            if self.message_buffer != message_str:
+                # The combined buffer doesn't parse. If this segment
+                # parses on its own, the buffered prefix is a dead
+                # fragment: drop it and deliver the segment so one
+                # bad chunk can't silence the connection.
+                try:
+                    message_json = json.loads(message_str)
+                except json.decoder.JSONDecodeError:
+                    pass
+                else:
+                    _LOGGER.warning(
+                        "Dropping unparseable buffered fragment: %s",
+                        self.message_buffer[: -len(message_str)],
+                    )
+                    self.on_data_callback(message_json)
+                    self.message_buffer = ""
+                    continue
+            _LOGGER.debug("Got partial message: %s", self.message_buffer)
 
     def init_run(self) -> None:
         """Init the run sequence and store run task."""
@@ -116,7 +158,10 @@ class _Connection:
         task = self.loop.create_task(self.run())
 
         def remove_task(_task):
-            self.tasks.remove(_task)
+            try:
+                self.tasks.remove(_task)
+            except KeyError:
+                pass  # already removed
 
         task.add_done_callback(remove_task)
         self.tasks.add(task)
@@ -130,6 +175,17 @@ class _Connection:
     def is_connected(self) -> bool:
         """Return whether or not connected."""
         return self.state == ConnectionState.CONNECTED
+
+    def is_errored(self) -> bool:
+        """Return True if this connection has failed terminally.
+
+        A connection in ERROR or CLOSED can never become CONNECTED
+        again (the run() state machine only moves forward), so
+        callers polling for connection establishment can bail as
+        soon as this returns True instead of waiting out their
+        full timeout.
+        """
+        return self.state in (ConnectionState.ERROR, ConnectionState.CLOSED)
 
     async def run(self) -> None:
         """State machine."""
