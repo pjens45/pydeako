@@ -1001,8 +1001,14 @@ class DeakoConnectionPool:
             or not self.active.is_connected()
         ):
             await self._ensure_primary_or_raise()
-        # Hot path: send via strict.
-        assert self.active is not None
+        # Hot path: send via strict. A concurrent stop() can null
+        # self.active between recovery and here; the contract is
+        # NoSocketException on no active connection, not AssertionError
+        # (which -O would strip entirely).
+        if self.active is None:
+            raise NoSocketException(
+                "no active connection after recovery",
+            )
         failed_host = self.primary_host
         try:
             # pylint: disable-next=protected-access
@@ -1030,7 +1036,13 @@ class DeakoConnectionPool:
             raise NoSocketException(msg)
         # Exactly one retry on the new active.
         new_host = self.primary_host
-        assert self.active is not None
+        if self.active is None:
+            # A stop() raced the switch and nulled the active; honor the
+            # NoSocketException contract instead of raising AssertionError.
+            raise NoSocketException(
+                f"failover switch reported success but no active "
+                f"connection remains; last active host was {failed_host}",
+            )
         try:
             # pylint: disable-next=protected-access
             await self.active._control_device_strict(

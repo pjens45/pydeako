@@ -81,38 +81,58 @@ class _Manager:
             _LOGGER.error("Already attempting to connect")
             return
         self.state.connecting = True
+        # Track the in-flight connection separately from self.connection
+        # so the finally block can tear it down if this coroutine is
+        # cancelled (or raises) before it is installed. A leaked
+        # _Connection keeps a live run() task and holds the bridge's
+        # single TCP slot until the process restarts -- the same zombie
+        # class as the pool's partial-connect. `installed` guards the
+        # success path so we don't close a connection we handed off.
+        connection: _Connection | None = None
+        installed = False
         try:
-            address, name = await self.get_address()
-        except DevicesNotFoundException:
-            _LOGGER.warning("No devices to connect to")
-            if self.auto_reconnect:
-                self.create_connection_task()
+            try:
+                address, name = await self.get_address()
+            except DevicesNotFoundException:
+                _LOGGER.warning("No devices to connect to")
+                if self.auto_reconnect:
+                    self.create_connection_task()
+                return
+            connection = _Connection(address, name, self.incoming_json)
+            timeout = 0
+            while (
+                not connection.is_connected()
+                and not connection.is_errored()
+                and timeout < CONNECTION_TIMEOUT_S
+            ):
+                await asyncio.sleep(CONNECTED_POLLING_INTERVAL_S)
+                timeout += CONNECTED_POLLING_INTERVAL_S
+            if not connection.is_connected():
+                _LOGGER.error("Failed to connect. Trying again")
+                if self.auto_reconnect:
+                    self.create_connection_task()
+                # connection is torn down by the finally block below
+                # (not installed), so it isn't closed twice.
+                return
+            self.connection = connection
+            installed = True
+            # init connection watching
+            if self.maintain_worker is None:
+                self.state.canceled = False
+                self.maintain_worker = asyncio.create_task(
+                    self.maintain_connection_worker()
+                )
+        finally:
+            # Always release the connecting latch, even on cancellation
+            # or an unexpected error from get_address(); otherwise every
+            # future init_connection() short-circuits on "Already
+            # attempting to connect" and the manager wedges permanently.
             self.state.connecting = False
-            return
-        connection = _Connection(address, name, self.incoming_json)
-        timeout = 0
-        while (
-            not connection.is_connected()
-            and not connection.is_errored()
-            and timeout < CONNECTION_TIMEOUT_S
-        ):
-            await asyncio.sleep(CONNECTED_POLLING_INTERVAL_S)
-            timeout += CONNECTED_POLLING_INTERVAL_S
-        if not connection.is_connected():
-            _LOGGER.error("Failed to connect. Trying again")
-            self.state.connecting = False
-            connection.close()
-            if self.auto_reconnect:
-                self.create_connection_task()
-            return
-        self.connection = connection
-        # init connection watching
-        if self.maintain_worker is None:
-            self.state.canceled = False
-            self.maintain_worker = asyncio.create_task(
-                self.maintain_connection_worker()
-            )
-        self.state.connecting = False
+            # Close any connection that was created but never installed
+            # (failed poll, cancelled mid-connect, unexpected raise) so
+            # its run() task and socket don't outlive this call.
+            if connection is not None and not installed:
+                connection.close()
 
     def close(self) -> None:
         """Close connection."""

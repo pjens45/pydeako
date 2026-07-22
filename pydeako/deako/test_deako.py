@@ -416,6 +416,73 @@ async def test_find_devices(asyncio_mock, manager_mock):
 @patch("pydeako.deako._deako.asyncio", autospec=True)
 @pytest.mark.asyncio
 # pylint: disable-next=unused-argument
+async def test_find_devices_overshoot_succeeds(
+    asyncio_mock, manager_mock, caplog,
+):
+    """A bridge that delivers MORE devices than announced succeeds.
+
+    After a profile change the announced count can lag reality (added
+    switches overshoot). Overshoot must count as success, not spin out
+    the timeout, and must not emit the partial-delivery warning.
+    """
+    deako = Deako(Mock())
+
+    async def announce_count():
+        deako.expected_devices = 10
+        return True
+
+    manager_mock.return_value.send_get_device_list.side_effect = (
+        announce_count
+    )
+    deako.devices = {str(i): i for i in range(12)}  # 12 > announced 10
+
+    with caplog.at_level(logging.WARNING, logger="pydeako.deako"):
+        await deako.find_devices()
+
+    assert not any(
+        "only found" in record.message for record in caplog.records
+    )
+    manager_mock.return_value.send_get_device_list.assert_called_once()
+
+
+@patch("pydeako.deako._deako._Manager", autospec=True)
+@patch("pydeako.deako._deako.asyncio", autospec=True)
+@pytest.mark.asyncio
+# pylint: disable-next=unused-argument
+async def test_find_devices_partial_delivery_proceeds_with_warning(
+    asyncio_mock, manager_mock, caplog,
+):
+    """Undershoot proceeds with the devices that responded, warning.
+
+    A removed/replaced switch can still be counted by the bridge while
+    never sending DEVICE_FOUND. find_devices must not fail the whole
+    connection over profile drift; it proceeds and logs a warning.
+    """
+    deako = Deako(Mock())
+
+    async def announce_count():
+        deako.expected_devices = 10
+        return True
+
+    manager_mock.return_value.send_get_device_list.side_effect = (
+        announce_count
+    )
+    deako.devices = {str(i): i for i in range(4)}  # 4 < announced 10
+
+    with caplog.at_level(logging.WARNING, logger="pydeako.deako"):
+        await deako.find_devices()  # does not raise
+
+    assert any(
+        "Expected 10 devices but only found 4" in record.message
+        for record in caplog.records
+    )
+    manager_mock.return_value.send_get_device_list.assert_called_once()
+
+
+@patch("pydeako.deako._deako._Manager", autospec=True)
+@patch("pydeako.deako._deako.asyncio", autospec=True)
+@pytest.mark.asyncio
+# pylint: disable-next=unused-argument
 async def test_find_devices_send_request_fails(asyncio_mock, manager_mock):
     """Test Deako.find_devices when sending device list request fails."""
     deako = Deako(Mock())

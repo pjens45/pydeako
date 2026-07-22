@@ -149,7 +149,12 @@ class Deako:
         """Request the device list."""
         _LOGGER.info("Finding devices")
         # Reset the announced count so a refresh on a live object
-        # cannot inherit a stale value from a previous call.
+        # cannot inherit a stale value from a previous call. `devices`
+        # is intentionally NOT reset: DEVICE_FOUND is treated as an
+        # upsert (record_device keys by uuid), so a refresh reconciles
+        # in place rather than dropping entities mid-flight. The
+        # integration always builds a fresh Deako per connect, so no
+        # caller relies on cross-call device accumulation today.
         self.expected_devices = 0
         success = await self.connection_manager.send_get_device_list()
         if not success:

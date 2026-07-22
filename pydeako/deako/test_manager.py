@@ -2,6 +2,7 @@
 Test the SocketConnection manager.
 """
 
+import asyncio
 import logging
 
 import pytest
@@ -156,6 +157,43 @@ async def test_init_connection(
     )
 
     assert not manager.state.connecting
+
+
+@patch("pydeako.deako._manager._Manager.create_connection_task")
+@patch("pydeako.deako._manager._Connection")
+@patch("pydeako.deako._manager.asyncio", autospec=True)
+@pytest.mark.asyncio
+# pylint: disable-next=unused-argument
+async def test_init_connection_cancelled_closes_orphan(
+    asyncio_mock,
+    connection_mock,
+    create_connection_mock,
+):
+    """Cancellation mid-connect closes the orphan and clears the latch.
+
+    Regression guard for the leak where a cancelled init_connection
+    abandoned a not-yet-installed _Connection (live run() task, held
+    TCP slot) and left state.connecting=True, wedging every later
+    connect attempt.
+    """
+    address, name = Mock(), Mock()
+    get_address = AsyncMock()
+
+    manager = _Manager(get_address, Mock())
+
+    get_address.return_value = address, name
+    connection_mock_instance = connection_mock.return_value
+    connection_mock_instance.is_connected.return_value = False
+    connection_mock_instance.is_errored.return_value = False
+    # Cancel the coroutine while it is polling for the connection.
+    asyncio_mock.sleep.side_effect = asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await manager.init_connection()
+
+    connection_mock_instance.close.assert_called_once()
+    assert not manager.state.connecting
+    assert manager.connection is None
 
 
 def test_close():
@@ -332,9 +370,14 @@ async def test_send_request(
 
     manager.connection = connection_mock
 
-    await manager.send_request(request_mock)
+    result = await manager.send_request(request_mock)
 
     connection_mock.send_data.assert_called_once_with("some message")
+    # A successful send fires the request's optimistic-state callback
+    # (N8): without this, HA state depended entirely on the bridge
+    # echoing an EVENT back.
+    request_mock.complete_callback.assert_called_once_with()
+    assert result is True
 
 
 @patch("pydeako.deako._manager._Request")
@@ -350,9 +393,13 @@ async def test_send_request_no_connection(
 
     manager = _Manager(AsyncMock(), Mock(), client_name=client_name)
 
-    await manager.send_request(request_mock)
+    result = await manager.send_request(request_mock)
 
     connection_mock.send_data.assert_not_called()
+    # No connection means the send never happened, so the optimistic
+    # callback must NOT fire.
+    request_mock.complete_callback.assert_not_called()
+    assert result is False
 
 
 # ---------------------------------------------------------------------------
