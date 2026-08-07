@@ -1,49 +1,90 @@
-"""Tests for DeakoConnectionPool scaffold, lifecycle, switch,
-recovery, and control_device paths.
+"""Tests for the two-manager DeakoConnectionPool.
 
-Covers phase 6 of the failover work: module constants, `_tcp_probe`,
-`_KeepAliveSocket`, `ConnectionPoolState`, pool `__init__`, `state()`,
-`is_connected()`, `set_state_callback`, device accessors, `start()`
-fail-fast and keepalive best-effort, terminal re-entrant `stop()`,
-host-name invariants, `_switch_to_failover`, `_attempt_recovery`,
-and the section 7.4/7.5 `control_device` paths.
+Covers: module constants, `_tcp_probe`, `ConnectionPoolState`, pool
+`__init__`, shared-cache accessors and callbacks, `start()` fail-fast
+plus best-effort standby, terminal re-entrant `stop()`, identity-
+dispatched session-lost handling, `_flip` semantics and anti-flap,
+the repair supervisor's probe gating and install guard, standby
+device-list verification, per-host EVENT counters, and every
+`control_device` path (happy, flip+retry, degraded fail-fast).
 """
-# pylint: disable=too-many-lines
+# pylint: disable=too-many-lines,protected-access
 
 import asyncio
-import dataclasses
 
 import pytest
-from mock import AsyncMock, MagicMock, Mock, patch
+from mock import AsyncMock, MagicMock, patch
 
-from ._deako import FindDevicesError
 from ._connection_pool import (
-    BRIDGE_RECYCLE_TIMEOUT_S,
     ConnectionPoolState,
     DEAKO_DEFAULT_PORT,
     DeakoConnectionPool,
     PROBE_TIMEOUT,
+    REPAIR_BACKOFF_MAX_S,
+    REPAIR_SETTLE_S,
+    REPAIR_TICK_S,
     STEP_TIMEOUT_S,
-    SWITCH_CONNECT_BACKOFF_S,
-    SWITCH_CONNECT_RETRIES,
-    SWITCH_WAIT_TIMEOUT_S,
-    _KeepAliveSocket,
     _tcp_probe,
 )
 from .utils._socket import NoSocketException
 
 
+# --- helpers -------------------------------------------------------
+
+def _fake_deako(connected: bool = True) -> MagicMock:
+    """Build a MagicMock that looks like a live Deako for the pool."""
+    deako = MagicMock()
+    deako.is_connected.return_value = connected
+    deako.connect = AsyncMock()
+    deako.find_devices = AsyncMock()
+    deako.disconnect = AsyncMock()
+    deako._control_device_strict = AsyncMock()
+    deako.connection_manager = MagicMock()
+    deako.connection_manager.auto_reconnect = True
+    return deako
+
+
+def _pool(**kwargs) -> DeakoConnectionPool:
+    return DeakoConnectionPool(
+        primary_host="10.0.0.1",
+        failover_host="10.0.0.2",
+        **kwargs,
+    )
+
+
+async def _drain() -> None:
+    """Let scheduled tasks run."""
+    for _ in range(4):
+        await asyncio.sleep(0)
+
+
+async def _started_pool(
+    active: MagicMock | None = None,
+    standby: MagicMock | None = None,
+    **kwargs,
+) -> tuple[DeakoConnectionPool, MagicMock, MagicMock, MagicMock]:
+    """Start a pool with two fakes; return (pool, active, standby, cls)."""
+    active = active if active is not None else _fake_deako()
+    standby = standby if standby is not None else _fake_deako()
+    with patch(
+        "pydeako.deako._connection_pool.Deako",
+        side_effect=[active, standby],
+    ) as deako_cls:
+        pool = _pool(**kwargs)
+        await pool.start()
+    return pool, active, standby, deako_cls
+
+
 # --- module constants ----------------------------------------------
 
 def test_module_constants_are_concrete():
-    """Module defines every constant used by the switch contracts."""
+    """Module defines every constant used by the pool contracts."""
     assert DEAKO_DEFAULT_PORT == 23
-    assert SWITCH_WAIT_TIMEOUT_S > 0
-    assert SWITCH_CONNECT_RETRIES == 3
-    assert SWITCH_CONNECT_BACKOFF_S == 1.0
-    assert BRIDGE_RECYCLE_TIMEOUT_S > 0
     assert PROBE_TIMEOUT > 0
     assert STEP_TIMEOUT_S == 2.0
+    assert REPAIR_TICK_S > 0
+    assert REPAIR_BACKOFF_MAX_S >= REPAIR_TICK_S
+    assert REPAIR_SETTLE_S >= 0
 
 
 # --- _tcp_probe ----------------------------------------------------
@@ -75,1757 +116,624 @@ async def test_tcp_probe_returns_false_on_oserror():
     assert result is False
 
 
-@pytest.mark.asyncio
-async def test_tcp_probe_returns_false_on_timeout():
-    """_tcp_probe returns False when wait_for times out."""
-    async def slow_open(*_args, **_kwargs):
-        await asyncio.sleep(10)
-    with patch(
-        "pydeako.deako._connection_pool.asyncio.open_connection",
-        new=slow_open,
-    ):
-        result = await _tcp_probe("10.0.0.1", timeout=0.01)
-    assert result is False
-
-
-# --- _KeepAliveSocket ----------------------------------------------
-
-def test_keepalive_init_records_host_and_port():
-    """KeepAlive stores target coordinates without opening anything."""
-    ka = _KeepAliveSocket("10.0.0.1")
-    assert ka.host == "10.0.0.1"
-    assert ka.port == DEAKO_DEFAULT_PORT
-    assert ka.is_running() is False
-
-
-@pytest.mark.asyncio
-async def test_keepalive_start_opens_socket_and_marks_running():
-    """start() opens the inner socket and flips is_running True."""
-    ka = _KeepAliveSocket("10.0.0.1")
-    fake_sock = MagicMock()
-    fake_sock.connect_socket = AsyncMock()
-    fake_sock.sock = MagicMock()  # non-None after connect_socket
-    with patch(
-        "pydeako.deako._connection_pool._SocketConnection",
-        return_value=fake_sock,
-    ):
-        await ka.start()
-    fake_sock.connect_socket.assert_awaited_once()
-    assert ka.is_running() is True
-
-
-@pytest.mark.asyncio
-async def test_keepalive_start_propagates_oserror():
-    """start() re-raises OSError from connect_socket."""
-    ka = _KeepAliveSocket("10.0.0.1")
-    fake_sock = MagicMock()
-    fake_sock.connect_socket = AsyncMock(side_effect=OSError("boom"))
-    with patch(
-        "pydeako.deako._connection_pool._SocketConnection",
-        return_value=fake_sock,
-    ):
-        with pytest.raises(OSError):
-            await ka.start()
-    assert ka.is_running() is False
-
-
-@pytest.mark.asyncio
-async def test_keepalive_stop_is_awaitable():
-    """stop() is a coroutine; awaiting it closes the inner socket."""
-    ka = _KeepAliveSocket("10.0.0.1")
-    inner = MagicMock()
-    ka._socket = inner  # pylint: disable=protected-access
-    ka._running = True  # pylint: disable=protected-access
-    coro = ka.stop()
-    assert asyncio.iscoroutine(coro)
-    await coro
-    inner.close_socket.assert_called_once()
-    assert ka.is_running() is False
-
-
-@pytest.mark.asyncio
-async def test_keepalive_stop_is_idempotent():
-    """Second stop() is a no-op."""
-    ka = _KeepAliveSocket("10.0.0.1")
-    await ka.stop()
-    await ka.stop()
-    assert ka.is_running() is False
-
-
 # --- ConnectionPoolState -------------------------------------------
 
-def test_connection_pool_state_fields():
-    """State has exactly the five fields in decision 23, no more."""
-    field_names = {f.name for f in dataclasses.fields(ConnectionPoolState)}
-    assert field_names == {
-        "primary_host",
-        "failover_host",
-        "primary_connected",
-        "failover_keepalive_active",
-        "started",
-    }
-
-
-def test_connection_pool_state_is_frozen():
-    """ConnectionPoolState is frozen: assignment raises."""
-    s = ConnectionPoolState(
-        primary_host="10.0.0.1",
-        failover_host="10.0.0.2",
-        primary_connected=False,
+def test_pool_state_is_frozen():
+    """Snapshots are immutable."""
+    snap = ConnectionPoolState(
+        primary_host="a",
+        failover_host="b",
+        primary_connected=True,
         failover_keepalive_active=False,
-        started=False,
+        started=True,
     )
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        s.primary_connected = True  # type: ignore[misc]
+    with pytest.raises(Exception):
+        snap.primary_host = "c"  # type: ignore[misc]
 
 
-# --- Pool __init__ and state ---------------------------------------
+# --- __init__ -------------------------------------------------------
 
-def test_pool_init_stores_hosts_and_starts_unstarted():
-    """Init holds both host names and switch_event begins set."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    assert pool.primary_host == "10.0.0.1"
-    assert pool.failover_host == "10.0.0.2"
-    assert pool.active is None
-    # pylint: disable-next=protected-access
-    assert pool._keepalive is None
-    # pylint: disable-next=protected-access
-    assert pool._started is False
-    # pylint: disable-next=protected-access
-    assert pool._stopped is False
+def test_init_rejects_same_hosts():
+    """primary_host == failover_host raises ValueError."""
+    with pytest.raises(ValueError):
+        DeakoConnectionPool(
+            primary_host="10.0.0.1", failover_host="10.0.0.1",
+        )
 
 
-def test_switch_event_set_on_init():
-    """`_switch_event` starts set so pre-switch waiters do not block."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    assert pool._switch_event.is_set() is True
-
-
-def test_state_pre_start_reports_degraded():
-    """Before start(), state shows unconnected primary and no keepalive."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    s = pool.state()
-    assert s.primary_host == "10.0.0.1"
-    assert s.failover_host == "10.0.0.2"
-    assert s.primary_connected is False
-    assert s.failover_keepalive_active is False
-    assert s.started is False
-
-
-def test_is_connected_false_with_no_active():
-    """is_connected() is False when the pool has no active Deako."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
+def test_init_initial_state():
+    """Fresh pool: not started, nothing connected, hosts recorded."""
+    pool = _pool()
+    snap = pool.state()
+    assert snap.primary_host == "10.0.0.1"
+    assert snap.failover_host == "10.0.0.2"
+    assert snap.primary_connected is False
+    assert snap.failover_keepalive_active is False
+    assert snap.started is False
     assert pool.is_connected() is False
 
 
-def test_is_connected_uses_deako_is_connected():
-    """is_connected() delegates to Deako.is_connected (decision 21)."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = MagicMock()
-    active.is_connected.return_value = True
-    pool.active = active
-    assert pool.is_connected() is True
-    active.is_connected.assert_called_once()
+# --- shared cache accessors ----------------------------------------
 
-
-# --- set_state_callback --------------------------------------------
-
-def test_set_state_callback_stores_on_pool():
-    """Callbacks are stored in the pool registry."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    cb = Mock()
-    pool.set_state_callback("uuid-a", cb)
-    # pylint: disable-next=protected-access
-    assert pool._state_callbacks["uuid-a"] is cb
-
-
-def test_set_state_callback_forwards_to_active_if_present():
-    """When active is set, set_state_callback also forwards to it."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = MagicMock()
-    pool.active = active
-    cb = Mock()
-    pool.set_state_callback("uuid-a", cb)
-    active.set_state_callback.assert_called_once_with("uuid-a", cb)
-
-
-def test_replay_callbacks_registers_all_on_new_deako():
-    """Replay installs every stored callback onto the new Deako."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    cb_a = Mock()
-    cb_b = Mock()
-    pool.set_state_callback("uuid-a", cb_a)
-    pool.set_state_callback("uuid-b", cb_b)
-    new_deako = MagicMock()
-    # pylint: disable-next=protected-access
-    pool._replay_callbacks(new_deako)
-    assert new_deako.set_state_callback.call_count >= 2
-
-
-# --- Device accessor proxies ---------------------------------------
-
-def test_get_devices_empty_when_no_active():
-    """get_devices returns {} when no active Deako."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    assert pool.get_devices() == {}
-
-
-def test_get_devices_proxies_to_active():
-    """get_devices proxies to the active connection."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = MagicMock()
-    active.get_devices.return_value = {"u": {}}
-    pool.active = active
-    assert pool.get_devices() == {"u": {}}
-
-
-def test_get_state_and_name_and_dimmable_proxy():
-    """get_state / get_name / is_dimmable proxy to active."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    assert pool.get_state("u") is None
-    assert pool.get_name("u") is None
-    assert pool.is_dimmable("u") is None
-    active = MagicMock()
-    active.get_state.return_value = {"power": True, "dim": 50}
-    active.get_name.return_value = "Kitchen"
-    active.is_dimmable.return_value = True
-    pool.active = active
+def test_accessors_read_shared_cache():
+    """Accessors answer from the pool-owned dict, not a session."""
+    pool = _pool()
+    pool._devices["u"] = {
+        "name": "Kitchen",
+        "uuid": "u",
+        "dimmable": True,
+        "state": {"power": True, "dim": 50},
+    }
+    assert pool.get_devices() is pool._devices
     assert pool.get_state("u") == {"power": True, "dim": 50}
     assert pool.get_name("u") == "Kitchen"
     assert pool.is_dimmable("u") is True
+    assert pool.get_state("missing") is None
 
 
-# --- start() -------------------------------------------------------
+def test_set_state_callback_lands_in_shared_dict():
+    """Callbacks registered before and after device load both land."""
+    pool = _pool()
+    early = MagicMock()
+    pool.set_state_callback("u", early)
+    # Entry did not exist yet; simulate a device load then re-apply.
+    pool._devices["u"] = {"state": {}}
+    pool._apply_callbacks()
+    assert pool._devices["u"]["callback"] is early
+    late = MagicMock()
+    pool.set_state_callback("u", late)
+    assert pool._devices["u"]["callback"] is late
 
-def _fake_deako_connected(connected: bool = True) -> MagicMock:
-    """Build a MagicMock that looks like a live Deako for the pool."""
-    deako = MagicMock()
-    deako.is_connected.return_value = connected
-    deako.connect = AsyncMock()
-    deako.find_devices = AsyncMock()
-    deako.disconnect = AsyncMock()
-    deako.set_state_callback = MagicMock()
-    deako.get_devices.return_value = {}
-    # Pool uses strict (decision 29); make it awaitable by default.
-    # pylint: disable-next=protected-access
-    deako._control_device_strict = AsyncMock()
-    # Mirror the connection_manager attribute used in
-    # _connect_primary when wiring auto_reconnect off.
-    deako.connection_manager = MagicMock()
-    deako.connection_manager.auto_reconnect = True
-    return deako
 
+# --- start() --------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_start_connects_primary_and_starts_keepalive():
-    """Happy path: primary connects, keepalive on failover starts."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    new_active = _fake_deako_connected()
-    with patch(
-        "pydeako.deako._connection_pool.Deako",
-        return_value=new_active,
-    ):
-        with patch.object(
-            _KeepAliveSocket, "start", new=AsyncMock(),
-        ):
-            await pool.start()
-    assert pool.active is new_active
-    # pylint: disable-next=protected-access
-    assert pool._started is True
-    s = pool.state()
-    assert s.started is True
-    assert s.primary_connected is True
+async def test_start_connects_both_sessions():
+    """Happy path: active + standby sessions, supervisor running."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        assert pool.active is active
+        assert pool.standby is standby
+        # Primary session did the device-list exchange; standby not.
+        active.find_devices.assert_awaited_once()
+        standby.find_devices.assert_not_awaited()
+        # Reconnect is centralized: both managers forced off.
+        assert active.connection_manager.auto_reconnect is False
+        assert standby.connection_manager.auto_reconnect is False
+        # Both sessions share the pool's device dict.
+        assert active.devices is pool._devices
+        assert standby.devices is pool._devices
+        snap = pool.state()
+        assert snap.started is True
+        assert snap.primary_connected is True
+        assert snap.failover_keepalive_active is True
+        assert pool._supervisor_task is not None
+    finally:
+        await pool.stop()
 
 
 @pytest.mark.asyncio
 async def test_start_raises_when_primary_unreachable():
-    """Fail-fast: primary connect raises and pool stays unstarted."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    broken = _fake_deako_connected(connected=False)
+    """Fail-fast: primary connect raises; pool unstarted, torn down."""
+    broken = _fake_deako(connected=False)
     broken.connect = AsyncMock(side_effect=OSError("no route"))
     with patch(
         "pydeako.deako._connection_pool.Deako",
         return_value=broken,
     ):
+        pool = _pool()
         with pytest.raises(NoSocketException):
             await pool.start()
-    assert pool.active is None
-    # pylint: disable-next=protected-access
     assert pool._started is False
-    # pylint: disable-next=protected-access
-    assert pool._keepalive is None
+    assert pool.active is None
+    broken.disconnect.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_failed_start_leaves_pool_unstarted():
-    """Failed start leaves _started False, active None, keepalive None."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    broken = _fake_deako_connected(connected=False)
-    broken.find_devices = AsyncMock(
-        side_effect=NoSocketException("no socket"),
-    )
+async def test_start_raises_when_primary_never_connects():
+    """connect() returns but never reaches CONNECTED: fail-fast."""
+    broken = _fake_deako(connected=False)
     with patch(
         "pydeako.deako._connection_pool.Deako",
         return_value=broken,
     ):
+        pool = _pool()
         with pytest.raises(NoSocketException):
             await pool.start()
-    s = pool.state()
-    assert s.started is False
-    assert s.primary_connected is False
-    assert s.failover_keepalive_active is False
-
-
-@pytest.mark.asyncio
-async def test_start_find_devices_error_tears_down_partial():
-    """FindDevicesError after a successful connect must tear down the
-    partial Deako (zombie would hold the bridge's single TCP slot)."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    zombie = _fake_deako_connected()
-    zombie.find_devices = AsyncMock(
-        side_effect=FindDevicesError("no devices"),
-    )
-    with patch(
-        "pydeako.deako._connection_pool.Deako",
-        return_value=zombie,
-    ):
-        with pytest.raises(FindDevicesError):
-            await pool.start()
-    zombie.disconnect.assert_awaited_once()
-    assert pool.active is None
-    # pylint: disable-next=protected-access
-    assert pool._partial_deako is None
-    # pylint: disable-next=protected-access
     assert pool._started is False
+    broken.disconnect.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_start_retries_after_failed_start():
-    """A second start() after a failed first attempt may succeed."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
+async def test_start_proceeds_degraded_when_standby_fails():
+    """Standby failure is non-fatal; supervisor owns the repair."""
+    active = _fake_deako()
+    broken_standby = _fake_deako()
+    broken_standby.connect = AsyncMock(side_effect=OSError("refused"))
+    pool, _, _, _ = await _started_pool(
+        active=active, standby=broken_standby,
     )
-    bad = _fake_deako_connected(connected=False)
-    bad.connect = AsyncMock(side_effect=OSError("down"))
-    good = _fake_deako_connected()
-    calls = {"n": 0}
-
-    def factory(*_args, **_kwargs):
-        calls["n"] += 1
-        return bad if calls["n"] == 1 else good
-
-    with patch(
-        "pydeako.deako._connection_pool.Deako", side_effect=factory,
-    ):
-        with pytest.raises(NoSocketException):
-            await pool.start()
-        with patch.object(
-            _KeepAliveSocket, "start", new=AsyncMock(),
-        ):
-            await pool.start()
-    # pylint: disable-next=protected-access
-    assert pool._started is True
-    assert pool.state().started is True
-
-
-@pytest.mark.asyncio
-async def test_start_is_idempotent():
-    """A second start() on a running pool is a no-op."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = _fake_deako_connected()
-    with patch(
-        "pydeako.deako._connection_pool.Deako", return_value=active,
-    ):
-        with patch.object(
-            _KeepAliveSocket, "start", new=AsyncMock(),
-        ) as ka_start:
-            await pool.start()
-            await pool.start()
-    # Deako factory may be called only during the first start; no
-    # second keepalive.start coroutine on the second call.
-    assert ka_start.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_start_succeeds_when_keepalive_start_fails():
-    """Keepalive failure at start is non-fatal (decision 27)."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = _fake_deako_connected()
-    with patch(
-        "pydeako.deako._connection_pool.Deako", return_value=active,
-    ):
-        with patch.object(
-            _KeepAliveSocket,
-            "start",
-            new=AsyncMock(side_effect=OSError("kaput")),
-        ):
-            await pool.start()
-    # pylint: disable-next=protected-access
-    assert pool._started is True
-    # pylint: disable-next=protected-access
-    assert pool._keepalive is None
-    s = pool.state()
-    assert s.primary_connected is True
-    assert s.failover_keepalive_active is False
-
-
-@pytest.mark.asyncio
-async def test_state_reflects_degraded_keepalive_after_failure():
-    """After a keepalive-start failure, state flags are correct."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = _fake_deako_connected()
-    with patch(
-        "pydeako.deako._connection_pool.Deako", return_value=active,
-    ):
-        with patch.object(
-            _KeepAliveSocket,
-            "start",
-            new=AsyncMock(side_effect=OSError("kaput")),
-        ):
-            await pool.start()
-    s = pool.state()
-    assert s.primary_connected is True
-    assert s.failover_keepalive_active is False
-    assert s.started is True
-
-
-# --- stop() --------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_stop_before_start_is_safe():
-    """stop() on a pool that never started completes without raising."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    await pool.stop()
-    # pylint: disable-next=protected-access
-    assert pool._stopped is True
-
-
-@pytest.mark.asyncio
-async def test_stop_is_reentrant():
-    """A second stop() is a no-op (no double-disconnect)."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = _fake_deako_connected()
-    pool.active = active
-    # pylint: disable-next=protected-access
-    pool._started = True
-    await pool.stop()
-    await pool.stop()
-    assert active.disconnect.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_stop_releases_event_waiters():
-    """Tasks parked on _switch_event.wait() wake after stop()."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    pool._switch_event.clear()
-
-    async def waiter():
-        # pylint: disable-next=protected-access
-        await pool._switch_event.wait()
-        return "awake"
-
-    task = asyncio.create_task(waiter())
-    await asyncio.sleep(0)  # let waiter park
-    await pool.stop()
-    result = await asyncio.wait_for(task, timeout=1.0)
-    assert result == "awake"
-
-
-@pytest.mark.asyncio
-async def test_stop_tears_down_keepalive_and_active():
-    """stop() disconnects active and stops keepalive."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = _fake_deako_connected()
-    pool.active = active
-    # pylint: disable-next=protected-access
-    pool._started = True
-    keepalive = MagicMock()
-    keepalive.stop = AsyncMock()
-    # pylint: disable-next=protected-access
-    pool._keepalive = keepalive
-    await pool.stop()
-    active.disconnect.assert_awaited_once()
-    keepalive.stop.assert_awaited_once()
-    assert pool.active is None
-    # pylint: disable-next=protected-access
-    assert pool._keepalive is None
-
-
-@pytest.mark.asyncio
-async def test_stop_swallows_keepalive_stop_timeout():
-    """Hung keepalive.stop() is bounded by STEP_TIMEOUT_S and swallowed."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-
-    async def hang():
-        await asyncio.sleep(30)
-
-    keepalive = MagicMock()
-    keepalive.stop = hang
-    # pylint: disable-next=protected-access
-    pool._keepalive = keepalive
-    with patch(
-        "pydeako.deako._connection_pool.asyncio.wait_for",
-        new=AsyncMock(side_effect=asyncio.TimeoutError()),
-    ):
+    try:
+        assert pool._started is True
+        assert pool.active is active
+        assert pool.standby is None
+        snap = pool.state()
+        assert snap.primary_connected is True
+        assert snap.failover_keepalive_active is False
+        broken_standby.disconnect.assert_awaited()
+    finally:
         await pool.stop()
-    # pylint: disable-next=protected-access
-    assert pool._stopped is True
-    # pylint: disable-next=protected-access
-    assert pool._keepalive is None
 
 
 @pytest.mark.asyncio
-async def test_stop_swallows_active_disconnect_timeout():
-    """Hung active.disconnect() is bounded and swallowed."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    active = _fake_deako_connected()
-    pool.active = active
-    # pylint: disable-next=protected-access
-    pool._started = True
-    with patch(
-        "pydeako.deako._connection_pool.asyncio.wait_for",
-        new=AsyncMock(side_effect=asyncio.TimeoutError()),
-    ):
-        await pool.stop()
-    assert pool.active is None
-
-
-@pytest.mark.asyncio
-async def test_start_after_stop_raises():
-    """start() after stop() raises RuntimeError (pool is single-use)."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
+async def test_start_is_idempotent_and_single_use():
+    """Second start() is a no-op; start() after stop() raises."""
+    pool, active, _, deako_cls = await _started_pool()
+    calls_after_first = deako_cls.call_count
+    await pool.start()
+    assert deako_cls.call_count == calls_after_first
     await pool.stop()
     with pytest.raises(RuntimeError):
         await pool.start()
+    assert active.disconnect.await_count >= 1
 
 
-# --- Host-name invariants ------------------------------------------
-
-@pytest.mark.asyncio
-async def test_host_names_never_none_through_failure_paths():
-    """Failed start() path does not null out the host fields."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    broken = _fake_deako_connected(connected=False)
-    broken.connect = AsyncMock(side_effect=OSError("down"))
-    with patch(
-        "pydeako.deako._connection_pool.Deako", return_value=broken,
-    ):
-        with pytest.raises(NoSocketException):
-            await pool.start()
-    s = pool.state()
-    assert isinstance(s.primary_host, str) and s.primary_host
-    assert isinstance(s.failover_host, str) and s.failover_host
-
+# --- stop() ---------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_host_names_never_none_after_stop():
-    """stop() preserves both host names on state()."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
+async def test_stop_tears_down_everything_and_is_reentrant():
+    """stop(): disconnects both sessions, kills supervisor, twice-safe."""
+    pool, active, standby, _ = await _started_pool()
     await pool.stop()
-    s = pool.state()
-    assert s.primary_host == "10.0.0.1"
-    assert s.failover_host == "10.0.0.2"
-
-
-# --- Helpers for switch / recovery tests ---------------------------
-
-def _started_pool(
-    primary: str = "10.0.0.1",
-    failover: str = "10.0.0.2",
-    active_connected: bool = True,
-) -> tuple[DeakoConnectionPool, MagicMock, MagicMock]:
-    """Build a pool in the started state without running start()."""
-    pool = DeakoConnectionPool(
-        primary_host=primary, failover_host=failover,
-    )
-    active = _fake_deako_connected(connected=active_connected)
-    pool.active = active
-    # pylint: disable-next=protected-access
-    pool._started = True
-    keepalive = MagicMock()
-    keepalive.stop = AsyncMock()
-    keepalive.is_running.return_value = True
-    # pylint: disable-next=protected-access
-    pool._keepalive = keepalive
-    return pool, active, keepalive
-
-
-# --- _switch_event lifecycle ---------------------------------------
-
-@pytest.mark.asyncio
-async def test_switch_event_set_after_success():
-    """Event is re-set after a successful _switch_to_failover."""
-    pool, _active, _ka = _started_pool()
-    new_active = _fake_deako_connected()
-    with patch.object(pool, "_wait_ready", AsyncMock(return_value=True)):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=new_active),
-        ):
-            with patch.object(
-                pool, "_start_keepalive", AsyncMock(),
-            ):
-                # pylint: disable-next=protected-access
-                ok = await pool._switch_to_failover(
-                    failed_host="10.0.0.1",
-                )
-    assert ok is True
-    # pylint: disable-next=protected-access
-    assert pool._switch_event.is_set() is True
-
-
-@pytest.mark.asyncio
-async def test_switch_event_set_after_failure():
-    """Event is re-set after a switch failure (host_not_ready)."""
-    pool, _active, _ka = _started_pool()
-    with patch.object(
-        pool, "_wait_ready", AsyncMock(return_value=False),
-    ):
-        # pylint: disable-next=protected-access
-        ok = await pool._switch_to_failover(failed_host="10.0.0.1")
-    assert ok is False
-    # pylint: disable-next=protected-access
-    assert pool._switch_event.is_set() is True
-
-
-@pytest.mark.asyncio
-async def test_switch_event_set_after_exception():
-    """Event is re-set even if the switch body raises."""
-    pool, _active, _ka = _started_pool()
-
-    async def boom(*_args, **_kwargs):
-        raise RuntimeError("boom")
-
-    with patch.object(pool, "_wait_ready", boom):
-        with pytest.raises(RuntimeError):
-            # pylint: disable-next=protected-access
-            await pool._switch_to_failover(failed_host="10.0.0.1")
-    # pylint: disable-next=protected-access
-    assert pool._switch_event.is_set() is True
-
-
-@pytest.mark.asyncio
-async def test_switch_event_set_on_stop():
-    """stop() sets _switch_event so parked waiters wake promptly."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    pool._switch_event.clear()
-    await pool.stop()
-    # pylint: disable-next=protected-access
-    assert pool._switch_event.is_set() is True
-
-
-# --- _switch_to_failover direct paths ------------------------------
-
-@pytest.mark.asyncio
-async def test_switch_success_swaps_hosts():
-    """A successful switch swaps primary_host with failover_host."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    new_active = _fake_deako_connected()
-    with patch.object(pool, "_wait_ready", AsyncMock(return_value=True)):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=new_active),
-        ):
-            with patch.object(
-                pool, "_start_keepalive", AsyncMock(),
-            ):
-                # pylint: disable-next=protected-access
-                ok = await pool._switch_to_failover(
-                    failed_host="10.0.0.1",
-                )
-    assert ok is True
-    assert pool.primary_host == "10.0.0.2"
-    assert pool.failover_host == "10.0.0.1"
-    assert pool.active is new_active
-
-
-@pytest.mark.asyncio
-async def test_switch_failure_preserves_host_mapping():
-    """A failed switch leaves the host map untouched."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    with patch.object(pool, "_wait_ready", AsyncMock(return_value=False)):
-        # pylint: disable-next=protected-access
-        ok = await pool._switch_to_failover(failed_host="10.0.0.1")
-    assert ok is False
-    assert pool.primary_host == "10.0.0.1"
-    assert pool.failover_host == "10.0.0.2"
-
-
-@pytest.mark.asyncio
-async def test_switch_retry_exhaustion():
-    """Connect-with-retry exhausts and the switch returns False."""
-    pool, _active, _ka = _started_pool()
-    with patch.object(pool, "_wait_ready", AsyncMock(return_value=True)):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(side_effect=OSError("nope")),
-        ):
-            with patch.object(
-                pool, "_cleanup_partial_connect", AsyncMock(),
-            ):
-                # Fast-forward the retry backoff sleeps.
-                with patch(
-                    "pydeako.deako._connection_pool.asyncio.sleep",
-                    new=AsyncMock(),
-                ):
-                    # pylint: disable-next=protected-access
-                    ok = await pool._switch_to_failover(
-                        failed_host="10.0.0.1",
-                    )
-    assert ok is False
-
-
-@pytest.mark.asyncio
-async def test_switch_stops_target_keepalive_before_probe():
-    """Keepalive.stop() is awaited before _wait_ready runs."""
-    pool, _active, keepalive = _started_pool()
-    order: list[str] = []
-
-    async def fake_ka_stop():
-        order.append("keepalive.stop")
-
-    async def fake_wait_ready(_host, **_kwargs):
-        order.append("wait_ready")
-        return False
-
-    keepalive.stop = fake_ka_stop
-    with patch.object(pool, "_wait_ready", fake_wait_ready):
-        # pylint: disable-next=protected-access
-        await pool._switch_to_failover(failed_host="10.0.0.1")
-    assert order[0] == "keepalive.stop"
-    assert "wait_ready" in order
-
-
-@pytest.mark.asyncio
-async def test_switch_disconnects_old_primary_before_probe():
-    """active.disconnect() runs before _wait_ready is called."""
-    pool, active, _keepalive = _started_pool()
-    order: list[str] = []
-
-    async def fake_disconnect():
-        order.append("active.disconnect")
-
-    async def fake_wait_ready(_host, **_kwargs):
-        order.append("wait_ready")
-        return False
-
-    active.disconnect = fake_disconnect
-    with patch.object(pool, "_wait_ready", fake_wait_ready):
-        # pylint: disable-next=protected-access
-        await pool._switch_to_failover(failed_host="10.0.0.1")
-    idx_disc = order.index("active.disconnect")
-    idx_wait = order.index("wait_ready")
-    assert idx_disc < idx_wait
-
-
-@pytest.mark.asyncio
-async def test_switch_teardown_uses_step_timeout():
-    """keepalive.stop() and active.disconnect() are bounded."""
-    pool, active, keepalive = _started_pool()
-
-    async def hang_ka():
-        await asyncio.sleep(30)
-
-    async def hang_disc():
-        await asyncio.sleep(30)
-
-    keepalive.stop = hang_ka
-    active.disconnect = hang_disc
-    with patch(
-        "pydeako.deako._connection_pool.asyncio.wait_for",
-        new=AsyncMock(side_effect=asyncio.TimeoutError()),
-    ):
-        with patch.object(
-            pool, "_wait_ready", AsyncMock(return_value=False),
-        ):
-            # pylint: disable-next=protected-access
-            ok = await pool._switch_to_failover(failed_host="10.0.0.1")
-    # Even though both teardowns hung, the switch proceeded and
-    # returned False via host_not_ready without wedging.
-    assert ok is False
-
-
-@pytest.mark.asyncio
-async def test_switch_concurrent_callers_wait_on_event():
-    """Second caller waits on _switch_event and returns the outcome."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    gate = asyncio.Event()
-    new_active = _fake_deako_connected()
-
-    async def slow_wait_ready(_host, **_kwargs):
-        await gate.wait()
-        return True
-
-    with patch.object(pool, "_wait_ready", slow_wait_ready):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=new_active),
-        ):
-            with patch.object(
-                pool, "_start_keepalive", AsyncMock(),
-            ):
-                first = asyncio.create_task(
-                    # pylint: disable-next=protected-access
-                    pool._switch_to_failover(failed_host="10.0.0.1"),
-                )
-                await asyncio.sleep(0)  # let first take the lock
-                second = asyncio.create_task(
-                    # pylint: disable-next=protected-access
-                    pool._switch_to_failover(failed_host="10.0.0.1"),
-                )
-                await asyncio.sleep(0)  # let second park
-                gate.set()
-                r1 = await first
-                r2 = await second
-    assert r1 is True
-    # Second caller sees primary has moved off failed_host.
-    assert r2 is True
-
-
-@pytest.mark.asyncio
-async def test_switch_failed_host_none_checks_connected_state():
-    """failed_host=None path returns actual connected state."""
-    pool, _active, _ka = _started_pool()
-    gate = asyncio.Event()
-    new_active = _fake_deako_connected()
-
-    async def slow_wait_ready(_host, **_kwargs):
-        await gate.wait()
-        return True
-
-    with patch.object(pool, "_wait_ready", slow_wait_ready):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=new_active),
-        ):
-            with patch.object(
-                pool, "_start_keepalive", AsyncMock(),
-            ):
-                first = asyncio.create_task(
-                    # pylint: disable-next=protected-access
-                    pool._switch_to_failover(failed_host="10.0.0.1"),
-                )
-                await asyncio.sleep(0)
-                second = asyncio.create_task(
-                    # pylint: disable-next=protected-access
-                    pool._switch_to_failover(failed_host=None),
-                )
-                await asyncio.sleep(0)
-                gate.set()
-                r1 = await first
-                r2 = await second
-    assert r1 is True
-    assert r2 is True
-
-
-@pytest.mark.asyncio
-async def test_switch_failed_host_stale_guard():
-    """If failed_host != primary_host, the switch returns True as no-op."""
-    pool, active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    # Pretend the switch has already happened; primary_host moved.
-    pool.primary_host = "10.0.0.2"
-    pool.failover_host = "10.0.0.1"
-    # pylint: disable-next=protected-access
-    ok = await pool._switch_to_failover(failed_host="10.0.0.1")
-    assert ok is True
-    # Old active is still in place; switch was a no-op.
-    assert pool.active is active
-
-
-@pytest.mark.asyncio
-async def test_switch_succeeds_when_new_keepalive_start_fails():
-    """Keepalive-start failure on the former primary is non-fatal."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    new_active = _fake_deako_connected()
-    with patch.object(pool, "_wait_ready", AsyncMock(return_value=True)):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=new_active),
-        ):
-            with patch.object(
-                pool, "_start_keepalive",
-                AsyncMock(side_effect=OSError("ka boom")),
-            ):
-                # pylint: disable-next=protected-access
-                ok = await pool._switch_to_failover(
-                    failed_host="10.0.0.1",
-                )
-    assert ok is True
-    assert pool.primary_host == "10.0.0.2"
-    # pylint: disable-next=protected-access
-    assert pool._keepalive is None
-
-
-@pytest.mark.asyncio
-async def test_stop_cancels_in_flight_switch():
-    """An in-flight switch observes _stopped and bails out."""
-    pool, _active, _ka = _started_pool()
-
-    async def slow_wait_ready(_host, **_kwargs):
-        # Simulate the switch sleeping during the probe window so
-        # stop() can flip _stopped before the next await.
-        await asyncio.sleep(0.1)
-        return True
-
-    with patch.object(pool, "_wait_ready", slow_wait_ready):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=_fake_deako_connected()),
-        ):
-            switch = asyncio.create_task(
-                # pylint: disable-next=protected-access
-                pool._switch_to_failover(failed_host="10.0.0.1"),
-            )
-            await asyncio.sleep(0)  # yield to let the switch start
-            await pool.stop()
-            ok = await switch
-    # The switch observed _stopped after the _wait_ready await and
-    # bailed out with False; stopped pools never declare success.
-    assert ok is False
-
-
-# --- _attempt_recovery ---------------------------------------------
-
-@pytest.mark.asyncio
-async def test_attempt_recovery_tries_primary_first_then_failover():
-    """Recovery probes primary first, then failover on miss."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    pool.active = None  # degraded
-    probed: list[str] = []
-
-    async def fake_probe(host, *_args, **_kwargs):
-        probed.append(host)
-        return False
-
-    with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=fake_probe,
-    ):
-        # pylint: disable-next=protected-access
-        ok, reasons = await pool._attempt_recovery()
-    assert ok is False
-    assert probed == ["10.0.0.1", "10.0.0.2"]
-    assert reasons.get("10.0.0.1") == "tcp_probe_failed"
-    assert reasons.get("10.0.0.2") == "tcp_probe_failed"
-
-
-@pytest.mark.asyncio
-async def test_attempt_recovery_succeeds_when_only_primary_responds():
-    """Recovery picks primary when only primary responds."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    pool.active = None
-
-    async def fake_probe(host, *_args, **_kwargs):
-        return host == "10.0.0.1"
-
-    new_active = _fake_deako_connected()
-    with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=fake_probe,
-    ):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=new_active),
-        ):
-            with patch.object(
-                pool, "_start_keepalive", AsyncMock(),
-            ):
-                # pylint: disable-next=protected-access
-                ok, reasons = await pool._attempt_recovery()
-    assert ok is True
-    assert reasons == {}
-    assert pool.primary_host == "10.0.0.1"
-    assert pool.failover_host == "10.0.0.2"
-    assert pool.active is new_active
-
-
-@pytest.mark.asyncio
-async def test_attempt_recovery_succeeds_when_only_failover_responds():
-    """Recovery promotes the failover when only it responds."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    pool.active = None
-
-    async def fake_probe(host, *_args, **_kwargs):
-        return host == "10.0.0.2"
-
-    new_active = _fake_deako_connected()
-    with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=fake_probe,
-    ):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=new_active),
-        ):
-            with patch.object(
-                pool, "_start_keepalive", AsyncMock(),
-            ):
-                # pylint: disable-next=protected-access
-                ok, _reasons = await pool._attempt_recovery()
-    assert ok is True
-    # Hosts swapped; new primary is the responsive one.
-    assert pool.primary_host == "10.0.0.2"
-    assert pool.failover_host == "10.0.0.1"
-
-
-@pytest.mark.asyncio
-async def test_attempt_recovery_raises_when_neither_responds():
-    """Recovery returns False with per-host reasons on total failure."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    pool.active = None
-
-    async def fake_probe(*_args, **_kwargs):
-        return False
-
-    with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=fake_probe,
-    ):
-        # pylint: disable-next=protected-access
-        ok, reasons = await pool._attempt_recovery()
-    assert ok is False
-    assert reasons == {
-        "10.0.0.1": "tcp_probe_failed",
-        "10.0.0.2": "tcp_probe_failed",
-    }
-
-
-@pytest.mark.asyncio
-async def test_attempt_recovery_stops_keepalive_before_probing():
-    """Keepalive.stop() is awaited before any TCP probe runs."""
-    pool, _active, keepalive = _started_pool()
-    pool.active = None
-    order: list[str] = []
-
-    async def fake_ka_stop():
-        order.append("keepalive.stop")
-
-    async def fake_probe(host, *_args, **_kwargs):
-        order.append(f"probe:{host}")
-        return False
-
-    keepalive.stop = fake_ka_stop
-    with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=fake_probe,
-    ):
-        # pylint: disable-next=protected-access
-        await pool._attempt_recovery()
-    assert order[0] == "keepalive.stop"
-    assert any(entry.startswith("probe:") for entry in order[1:])
-
-
-@pytest.mark.asyncio
-async def test_attempt_recovery_disconnects_stale_active_before_probe():
-    """Stale active is disconnected before any probe runs."""
-    pool, active, _keepalive = _started_pool()
-    # Half-dead active: present but not connected.
-    active.is_connected.return_value = False
-    order: list[str] = []
-
-    async def fake_disconnect():
-        order.append("active.disconnect")
-
-    async def fake_probe(host, *_args, **_kwargs):
-        order.append(f"probe:{host}")
-        return False
-
-    active.disconnect = fake_disconnect
-    with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=fake_probe,
-    ):
-        # pylint: disable-next=protected-access
-        await pool._attempt_recovery()
-    assert "active.disconnect" in order
-    disc_idx = order.index("active.disconnect")
-    probe_idx = next(
-        i for i, v in enumerate(order) if v.startswith("probe:")
-    )
-    assert disc_idx < probe_idx
+    active.disconnect.assert_awaited()
+    standby.disconnect.assert_awaited()
     assert pool.active is None
+    assert pool.standby is None
+    assert pool._supervisor_task is None
+    assert pool.state().started is False
+    await pool.stop()  # re-entrant
+
+
+# --- control_device: happy and degraded paths -----------------------
+
+@pytest.mark.asyncio
+async def test_control_device_sends_on_active():
+    """Happy path: strict send on the active session only."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        await pool.control_device("u", True, 40)
+        active._control_device_strict.assert_awaited_once_with(
+            "u", True, 40,
+        )
+        standby._control_device_strict.assert_not_awaited()
+    finally:
+        await pool.stop()
 
 
 @pytest.mark.asyncio
-async def test_recovery_succeeds_when_new_keepalive_start_fails():
-    """Recovery still returns True when new keepalive start raises."""
-    pool, _active, _ka = _started_pool()
-    pool.active = None
-
-    async def fake_probe(host, *_args, **_kwargs):
-        return host == "10.0.0.1"
-
-    with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=fake_probe,
-    ):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=_fake_deako_connected()),
-        ):
-            with patch.object(
-                pool, "_start_keepalive",
-                AsyncMock(side_effect=OSError("boom")),
-            ):
-                # pylint: disable-next=protected-access
-                ok, _reasons = await pool._attempt_recovery()
-    assert ok is True
-    # pylint: disable-next=protected-access
-    assert pool._keepalive is None
-
-
-# --- control_device ------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_control_device_after_stop_raises():
-    """control_device() after stop() raises NoSocketException."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
+async def test_control_device_raises_after_stop():
+    """control_device on a stopped pool raises NoSocketException."""
+    pool, _, _, _ = await _started_pool()
     await pool.stop()
     with pytest.raises(NoSocketException):
-        await pool.control_device("u", True, 100)
+        await pool.control_device("u", True)
 
 
 @pytest.mark.asyncio
-async def test_control_device_sends_without_switch_when_active_healthy():
-    """Happy path: send succeeds, no switch, strict path called once."""
-    pool, active, _ka = _started_pool()
-    await pool.control_device("u", True, 100)
-    # pylint: disable-next=protected-access
-    active._control_device_strict.assert_awaited_once_with(
-        "u", True, 100,
+async def test_control_device_flips_when_active_dead():
+    """Dead active + connected standby: flip first, then send."""
+    fired = []
+    pool, active, standby, _ = await _started_pool(
+        on_failover_switch=lambda p, f: fired.append((p, f)),
     )
-
-
-@pytest.mark.asyncio
-async def test_pool_uses_control_device_strict_not_public():
-    """Pool invokes _control_device_strict, not public control_device."""
-    pool, active, _ka = _started_pool()
-    await pool.control_device("u", True, 100)
-    active.control_device.assert_not_called()
-    # pylint: disable-next=protected-access
-    active._control_device_strict.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_control_device_triggers_switch_on_send_oserror():
-    """OSError from strict triggers one _switch_to_failover call."""
-    pool, active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    active._control_device_strict = AsyncMock(
-        side_effect=OSError("send broke"),
-    )
-    new_active = _fake_deako_connected()
-
-    async def switch_stub(**_kwargs):
-        # Simulate successful switch: host swap and new active.
-        pool.primary_host, pool.failover_host = (
-            pool.failover_host, pool.primary_host,
+    try:
+        active.is_connected.return_value = False
+        await pool.control_device("u", False)
+        assert pool.active is standby
+        assert pool.primary_host == "10.0.0.2"
+        assert pool.failover_host == "10.0.0.1"
+        standby._control_device_strict.assert_awaited_once_with(
+            "u", False, None,
         )
-        pool.active = new_active
-        return True
-
-    with patch.object(
-        pool, "_switch_to_failover", side_effect=switch_stub,
-    ) as switch_mock:
-        await pool.control_device("u", True, 100)
-    switch_mock.assert_called_once()
-    kwargs = switch_mock.call_args.kwargs
-    assert kwargs.get("failed_host") == "10.0.0.1"
-
-
-@pytest.mark.asyncio
-async def test_control_device_triggers_switch_on_send_nosocketexception():
-    """NoSocketException from strict also triggers one switch."""
-    pool, active, _ka = _started_pool()
-    # pylint: disable-next=protected-access
-    active._control_device_strict = AsyncMock(
-        side_effect=NoSocketException("no socket"),
-    )
-    new_active = _fake_deako_connected()
-
-    async def switch_stub(**_kwargs):
-        pool.primary_host, pool.failover_host = (
-            pool.failover_host, pool.primary_host,
-        )
-        pool.active = new_active
-        return True
-
-    with patch.object(
-        pool, "_switch_to_failover", side_effect=switch_stub,
-    ) as switch_mock:
-        await pool.control_device("u", True, 100)
-    switch_mock.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_control_device_retries_once_on_new_active_after_switch():
-    """After a successful switch, strict is called once on new active."""
-    pool, active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    active._control_device_strict = AsyncMock(
-        side_effect=OSError("send broke"),
-    )
-    new_active = _fake_deako_connected()
-
-    async def switch_stub(**_kwargs):
-        pool.primary_host, pool.failover_host = (
-            pool.failover_host, pool.primary_host,
-        )
-        pool.active = new_active
-        return True
-
-    with patch.object(
-        pool, "_switch_to_failover", side_effect=switch_stub,
-    ):
-        await pool.control_device("u", True, 100)
-    # pylint: disable-next=protected-access
-    new_active._control_device_strict.assert_awaited_once_with(
-        "u", True, 100,
-    )
-
-
-@pytest.mark.asyncio
-async def test_control_device_raises_when_retry_on_new_active_fails():
-    """Retry OSError after switch names both hosts in the message."""
-    pool, active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    active._control_device_strict = AsyncMock(
-        side_effect=OSError("first"),
-    )
-    new_active = _fake_deako_connected()
-    # pylint: disable-next=protected-access
-    new_active._control_device_strict = AsyncMock(
-        side_effect=OSError("second"),
-    )
-
-    async def switch_stub(**_kwargs):
-        pool.primary_host, pool.failover_host = (
-            pool.failover_host, pool.primary_host,
-        )
-        pool.active = new_active
-        return True
-
-    with patch.object(
-        pool, "_switch_to_failover", side_effect=switch_stub,
-    ):
-        with pytest.raises(NoSocketException) as excinfo:
-            await pool.control_device("u", True, 100)
-    msg = str(excinfo.value)
-    assert "10.0.0.1" in msg
-    assert "10.0.0.2" in msg
-
-
-@pytest.mark.asyncio
-async def test_control_device_raises_when_switch_fails_no_cascade():
-    """Switch returns False; _attempt_recovery is not invoked."""
-    pool, active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    active._control_device_strict = AsyncMock(
-        side_effect=OSError("broke"),
-    )
-    with patch.object(
-        pool, "_switch_to_failover", AsyncMock(return_value=False),
-    ):
-        with patch.object(
-            pool, "_attempt_recovery", AsyncMock(),
-        ) as rec_mock:
-            with pytest.raises(NoSocketException) as excinfo:
-                await pool.control_device("u", True, 100)
-    rec_mock.assert_not_called()
-    assert "10.0.0.1" in str(excinfo.value)
-
-
-@pytest.mark.asyncio
-async def test_control_device_next_call_runs_recovery_via_no_primary_path():
-    """After a failed switch, the next call enters section 7.5."""
-    pool, active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    active._control_device_strict = AsyncMock(
-        side_effect=OSError("broke"),
-    )
-    # Simulate the post-failure degraded state: no connected active.
-    pool.active = None
-    with patch.object(
-        pool, "_attempt_recovery",
-        AsyncMock(return_value=(False, {
-            "10.0.0.1": "tcp_probe_failed",
-            "10.0.0.2": "tcp_probe_failed",
-        })),
-    ) as rec_mock:
-        with pytest.raises(NoSocketException):
-            await pool.control_device("u", True, 100)
-    rec_mock.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_control_device_triggers_recovery_when_no_primary():
-    """No-primary entry: _attempt_recovery is called, then send."""
-    pool, _active, _ka = _started_pool()
-    pool.active = None
-    new_active = _fake_deako_connected()
-
-    async def recover():
-        pool.active = new_active
-        return True, {}
-
-    with patch.object(
-        pool, "_attempt_recovery", side_effect=recover,
-    ) as rec_mock:
-        await pool.control_device("u", True, 100)
-    rec_mock.assert_awaited_once()
-    # pylint: disable-next=protected-access
-    new_active._control_device_strict.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_control_device_raises_when_no_primary_after_failed_recovery():
-    """Recovery failure surfaces NoSocketException with both hosts."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    pool.active = None
-    with patch.object(
-        pool, "_attempt_recovery",
-        AsyncMock(return_value=(False, {
-            "10.0.0.1": "tcp_probe_failed",
-            "10.0.0.2": "connect_exhausted",
-        })),
-    ):
-        with pytest.raises(NoSocketException) as excinfo:
-            await pool.control_device("u", True, 100)
-    msg = str(excinfo.value)
-    assert "10.0.0.1" in msg
-    assert "tcp_probe_failed" in msg
-    assert "10.0.0.2" in msg
-    assert "connect_exhausted" in msg
-
-
-# --- Decision-25 messages ------------------------------------------
-
-@pytest.mark.asyncio
-async def test_nosocketexception_message_includes_hosts_tried():
-    """The raised NoSocketException names both hosts and reasons."""
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    pool.active = None
-    with patch.object(
-        pool, "_attempt_recovery",
-        AsyncMock(return_value=(False, {
-            "10.0.0.1": "connect_exhausted",
-            "10.0.0.2": "tcp_probe_failed",
-        })),
-    ):
-        with pytest.raises(NoSocketException) as excinfo:
-            await pool.control_device("u", True, 100)
-    msg = str(excinfo.value)
-    assert "primary=10.0.0.1" in msg
-    assert "connect_exhausted" in msg
-    assert "failover=10.0.0.2" in msg
-    assert "tcp_probe_failed" in msg
-
-
-@pytest.mark.asyncio
-async def test_nosocketexception_message_on_switch_wait_timeout():
-    """Recovery's concurrent-wait timeout produces switch_wait_timeout."""
-    pool, _active, _ka = _started_pool()
-    pool.active = None
-
-    # Grab the lock and park.
-    with patch.object(
-        pool, "_wait_ready", AsyncMock(return_value=True),
-    ):
-        with patch.object(
-            pool, "_connect_primary",
-            AsyncMock(return_value=_fake_deako_connected()),
-        ):
-            with patch.object(
-                pool, "_start_keepalive", AsyncMock(),
-            ):
-                # Start a switch that never completes.
-                held = asyncio.Event()
-
-                async def held_wait_ready(_host, **_kwargs):
-                    held.set()
-                    await asyncio.sleep(30)
-                    return True
-
-                with patch.object(
-                    pool, "_wait_ready", held_wait_ready,
-                ):
-                    task = asyncio.create_task(
-                        # pylint: disable-next=protected-access
-                        pool._switch_to_failover(
-                            failed_host="10.0.0.1",
-                        ),
-                    )
-                    await held.wait()
-                    # Now call recovery via low-level path.
-                    with patch(
-                        "pydeako.deako._connection_pool."
-                        "SWITCH_WAIT_TIMEOUT_S",
-                        0.01,
-                    ):
-                        # pylint: disable-next=protected-access
-                        ok, reasons = await pool._attempt_recovery()
-                    task.cancel()
-                    try:
-                        await task
-                    # pylint: disable-next=broad-exception-caught
-                    except (asyncio.CancelledError, Exception):
-                        pass
-    assert ok is False
-    assert reasons.get(pool.primary_host) == "switch_wait_timeout"
-    assert reasons.get(pool.failover_host) == "switch_wait_timeout"
-
-
-@pytest.mark.asyncio
-async def test_nosocketexception_message_on_in_flight_switch_failed():
-    """Recovery waits for in-flight switch that yields no active."""
-    pool, _active, _ka = _started_pool()
-    pool.active = None
-
-    gate = asyncio.Event()
-
-    async def slow_wait_ready(_host, **_kwargs):
-        await gate.wait()
-        return False  # causes switch failure
-
-    with patch.object(pool, "_wait_ready", slow_wait_ready):
-        task = asyncio.create_task(
-            # pylint: disable-next=protected-access
-            pool._switch_to_failover(failed_host="10.0.0.1"),
-        )
-        await asyncio.sleep(0)  # let switch take the lock
-        recovery = asyncio.create_task(
-            # pylint: disable-next=protected-access
-            pool._attempt_recovery(),
-        )
-        await asyncio.sleep(0)  # let recovery park
-        gate.set()
-        _ = await task
-        ok, reasons = await recovery
-    assert ok is False
-    for host in (pool.primary_host, pool.failover_host):
-        assert reasons[host] == "in_flight_switch_failed"
-
-
-@pytest.mark.asyncio
-async def test_nosocketexception_message_on_stopped_mid_loop():
-    """Setting _stopped mid-recovery yields 'stopped' for both hosts."""
-    pool, _active, _ka = _started_pool()
-    pool.active = None
-
-    first_probe_done = asyncio.Event()
-
-    async def fake_probe(host, *_args, **_kwargs):
-        if host == "10.0.0.1":
-            first_probe_done.set()
-            # Let the test flip _stopped after the first probe.
-            await asyncio.sleep(0)
-            return False
-        return False
-
-    with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=fake_probe,
-    ):
-        task = asyncio.create_task(
-            # pylint: disable-next=protected-access
-            pool._attempt_recovery(),
-        )
-        await first_probe_done.wait()
-        # pylint: disable-next=protected-access
-        pool._stopped = True
-        ok, reasons = await task
-    assert ok is False
-    assert reasons == {
-        "10.0.0.1": "stopped",
-        "10.0.0.2": "stopped",
-    }
-
-
-# --- _connect_primary partial-failure cleanup ----------------------
-
-@pytest.mark.asyncio
-async def test_connect_primary_partial_failure_cleanup():
-    """A failed _connect_primary leaves no partial Deako live."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    broken = _fake_deako_connected()
-    broken.find_devices = AsyncMock(side_effect=OSError("boom"))
-    with patch(
-        "pydeako.deako._connection_pool.Deako", return_value=broken,
-    ):
-        with pytest.raises(OSError):
-            # pylint: disable-next=protected-access
-            await pool._connect_primary("10.0.0.1")
-        # Partial deako is still tracked; cleanup clears it and
-        # disconnects the half-constructed object.
-        # pylint: disable-next=protected-access
-        assert pool._partial_deako is broken
-        # pylint: disable-next=protected-access
-        await pool._cleanup_partial_connect()
-    broken.disconnect.assert_awaited_once()
-    # pylint: disable-next=protected-access
-    assert pool._partial_deako is None
-
-
-# --- on_connection_lost hook ---------------------------------------
-
-@pytest.mark.asyncio
-async def test_on_connection_lost_schedules_switch():
-    """The sync hook schedules a _switch_to_failover task."""
-    pool, _active, _ka = _started_pool()
-    with patch.object(
-        pool, "_switch_to_failover", AsyncMock(return_value=True),
-    ) as switch_mock:
-        # pylint: disable-next=protected-access
-        pool._on_active_connection_lost()
-        # Let the scheduled task run.
-        await asyncio.sleep(0)
-        # Drain: the task is tracked in _on_lost_tasks.
-        # pylint: disable-next=protected-access
-        for task in list(pool._on_lost_tasks):
-            await task
-    switch_mock.assert_awaited_once()
-    assert (
-        switch_mock.call_args.kwargs.get("failed_host")
-        == pool.primary_host
-    )
-
-
-def test_on_connection_lost_noop_when_stopped():
-    """Hook is a no-op once the pool is stopped."""
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    # pylint: disable-next=protected-access
-    pool._stopped = True
-    # Does not raise; does not schedule anything.
-    # pylint: disable-next=protected-access
-    pool._on_active_connection_lost()
-
-
-# --- fix(pool): stop-race and same-host guards --------------------
-
-def test_init_rejects_same_host_primary_and_failover():
-    """Constructor rejects single-bridge configuration per docstring.
-
-    The pool docstring promises single-bridge pools are unsupported;
-    constructing one must raise ValueError rather than silently
-    returning a pool whose failover target equals its primary.
-    """
-    with pytest.raises(ValueError):
-        DeakoConnectionPool(
-            primary_host="10.0.0.1",
-            failover_host="10.0.0.1",
-        )
-
-
-@pytest.mark.asyncio
-async def test_start_discards_new_active_if_stopped_mid_connect():
-    """stop() during start()'s connect must not install late Deako.
-
-    If _connect_primary is in flight when stop() sets _stopped=True,
-    the freshly connected Deako returned after the await must be
-    disconnected and discarded, not installed on self.active.
-    """
-    pool = DeakoConnectionPool(
-        primary_host="10.0.0.1", failover_host="10.0.0.2",
-    )
-    new_active = _fake_deako_connected()
-    release = asyncio.Event()
-
-    async def blocked(_host):
-        await release.wait()
-        return new_active
-
-    with patch.object(
-        DeakoConnectionPool,
-        "_connect_primary",
-        new=AsyncMock(side_effect=blocked),
-    ):
-        start_task = asyncio.create_task(pool.start())
-        # Yield so start_task enters the connect await.
-        await asyncio.sleep(0)
+        assert fired == [("10.0.0.2", "10.0.0.1")]
+    finally:
         await pool.stop()
-        release.set()
-        await start_task
-    assert pool.active is None
-    # pylint: disable-next=protected-access
-    assert pool._started is False
-    new_active.disconnect.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_switch_discards_new_active_if_stopped_mid_connect():
-    """stop() during _switch_to_failover must not install late Deako.
-
-    If _connect_with_retry is in flight when stop() sets _stopped,
-    the switch must disconnect the freshly connected Deako, return
-    False, and leave the host map untouched.
-    """
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    new_active = _fake_deako_connected()
-    release = asyncio.Event()
-
-    async def blocked(_host):
-        await release.wait()
-        return new_active
-
-    with patch.object(
-        pool, "_wait_ready", AsyncMock(return_value=True),
-    ):
-        with patch.object(
-            pool, "_connect_with_retry",
-            AsyncMock(side_effect=blocked),
-        ):
-            # pylint: disable-next=protected-access
-            switch_task = asyncio.create_task(
-                pool._switch_to_failover(failed_host="10.0.0.1"),
-            )
-            await asyncio.sleep(0)
-            await pool.stop()
-            release.set()
-            ok = await switch_task
-    assert ok is False
-    assert pool.active is None
-    assert pool.primary_host == "10.0.0.1"
-    assert pool.failover_host == "10.0.0.2"
-    new_active.disconnect.assert_awaited()
+async def test_control_device_fails_fast_when_nothing_usable():
+    """Dead active + dead standby: quick NoSocketException, no connects."""
+    pool, active, standby, deako_cls = await _started_pool()
+    try:
+        active.is_connected.return_value = False
+        standby.is_connected.return_value = False
+        calls_before = deako_cls.call_count
+        with pytest.raises(NoSocketException):
+            await pool.control_device("u", True)
+        # Fail-fast contract: no inline session builds.
+        assert deako_cls.call_count == calls_before
+        # Hosts unchanged: nothing was promoted.
+        assert pool.primary_host == "10.0.0.1"
+        assert pool._repair_wake.is_set()
+    finally:
+        await pool.stop()
 
 
 @pytest.mark.asyncio
-async def test_recovery_discards_new_active_if_stopped_mid_connect():
-    """stop() during _attempt_recovery must not install late Deako.
+async def test_control_device_send_failure_flips_and_retries():
+    """OSError on active send: one flip, one retry on new active."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        active._control_device_strict = AsyncMock(
+            side_effect=OSError("broken pipe"),
+        )
+        await pool.control_device("u", True, 75)
+        active._control_device_strict.assert_awaited_once()
+        standby._control_device_strict.assert_awaited_once_with(
+            "u", True, 75,
+        )
+        assert pool.active is standby
+        assert pool.primary_host == "10.0.0.2"
+        # Demoted session gets torn down in the background.
+        await _drain()
+        active.disconnect.assert_awaited()
+    finally:
+        await pool.stop()
 
-    If _connect_with_retry is in flight when stop() sets _stopped,
-    recovery must disconnect the freshly connected Deako, return
-    (False, reasons) with "stopped" tokens, and leave host map alone.
-    """
-    pool, _active, _ka = _started_pool(
-        primary="10.0.0.1", failover="10.0.0.2",
-    )
-    new_deako = _fake_deako_connected()
-    release = asyncio.Event()
 
-    async def blocked(_host):
-        await release.wait()
-        return new_deako
+@pytest.mark.asyncio
+async def test_control_device_send_failure_without_standby_raises():
+    """OSError on send and no connected standby: NoSocketException."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        active._control_device_strict = AsyncMock(
+            side_effect=OSError("broken pipe"),
+        )
+        standby.is_connected.return_value = False
+        with pytest.raises(NoSocketException):
+            await pool.control_device("u", True)
+        assert pool.primary_host == "10.0.0.1"
+        assert pool.active is active
+    finally:
+        await pool.stop()
 
+
+@pytest.mark.asyncio
+async def test_control_device_retry_failure_names_both_hosts():
+    """Both sends fail across the flip: exception names both hosts."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        active._control_device_strict = AsyncMock(
+            side_effect=OSError("first"),
+        )
+        standby._control_device_strict = AsyncMock(
+            side_effect=OSError("second"),
+        )
+        with pytest.raises(NoSocketException) as excinfo:
+            await pool.control_device("u", True)
+        msg = str(excinfo.value)
+        assert "10.0.0.1" in msg
+        assert "10.0.0.2" in msg
+    finally:
+        await pool.stop()
+
+
+# --- session-lost dispatch ------------------------------------------
+
+@pytest.mark.asyncio
+async def test_active_ping_timeout_triggers_flip():
+    """Manager loss callback on the active promotes the standby."""
+    fired = []
+    active = _fake_deako()
+    standby = _fake_deako()
     with patch(
-        "pydeako.deako._connection_pool._tcp_probe",
-        new=AsyncMock(return_value=True),
-    ):
-        with patch.object(
-            pool, "_connect_with_retry",
-            AsyncMock(side_effect=blocked),
+        "pydeako.deako._connection_pool.Deako",
+        side_effect=[active, standby],
+    ) as deako_cls:
+        pool = _pool(
+            on_failover_switch=lambda p, f: fired.append((p, f)),
+        )
+        await pool.start()
+    try:
+        on_lost = deako_cls.call_args_list[0].kwargs[
+            "on_connection_lost"
+        ]
+        active.is_connected.return_value = False
+        on_lost()
+        await _drain()
+        assert pool.active is standby
+        assert pool.primary_host == "10.0.0.2"
+        assert fired == [("10.0.0.2", "10.0.0.1")]
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_standby_loss_drops_slot_without_flip():
+    """Manager loss callback on the standby never flips roles."""
+    active = _fake_deako()
+    standby = _fake_deako()
+    with patch(
+        "pydeako.deako._connection_pool.Deako",
+        side_effect=[active, standby],
+    ) as deako_cls:
+        pool = _pool()
+        await pool.start()
+    try:
+        on_lost = deako_cls.call_args_list[1].kwargs[
+            "on_connection_lost"
+        ]
+        on_lost()
+        await _drain()
+        assert pool.active is active
+        assert pool.primary_host == "10.0.0.1"
+        assert pool.standby is None
+        assert pool._repair_wake.is_set()
+        standby.disconnect.assert_awaited()
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_superseded_session_loss_is_ignored():
+    """A loss callback from a demoted session changes nothing."""
+    pool, active, standby, deako_cls = await _started_pool()
+    try:
+        active.is_connected.return_value = False
+        assert await pool._flip("10.0.0.1") is True
+        # Old active fires its loss callback late.
+        on_lost = deako_cls.call_args_list[0].kwargs[
+            "on_connection_lost"
+        ]
+        on_lost()
+        await _drain()
+        assert pool.active is standby
+        assert pool.primary_host == "10.0.0.2"
+    finally:
+        await pool.stop()
+
+
+# --- flip semantics -------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_flip_requires_connected_standby():
+    """No connected standby: flip returns False and kicks repair."""
+    pool, _, standby, _ = await _started_pool()
+    try:
+        standby.is_connected.return_value = False
+        pool._repair_wake.clear()
+        assert await pool._flip("10.0.0.1") is False
+        assert pool._repair_wake.is_set()
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_flip_stale_failed_host_reports_current_health():
+    """A flip request for an already-replaced host is a no-op."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        assert await pool._flip("10.0.0.99") is True
+        assert pool.active is active
+        assert pool.standby is standby
+    finally:
+        await pool.stop()
+
+
+# --- repair supervisor ----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_repair_standby_probe_gated():
+    """Probe failure skips the connect attempt entirely."""
+    pool, _, _, deako_cls = await _started_pool()
+    try:
+        pool.standby = None
+        calls_before = deako_cls.call_count
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=False),
         ):
-            # pylint: disable-next=protected-access
-            rec_task = asyncio.create_task(pool._attempt_recovery())
-            await asyncio.sleep(0)
-            await pool.stop()
-            release.set()
-            ok, reasons = await rec_task
-    assert ok is False
-    assert reasons == {
-        "10.0.0.1": "stopped",
-        "10.0.0.2": "stopped",
-    }
-    assert pool.active is None
-    assert pool.primary_host == "10.0.0.1"
-    assert pool.failover_host == "10.0.0.2"
-    new_deako.disconnect.assert_awaited()
+            assert await pool._repair_standby() is False
+        assert deako_cls.call_count == calls_before
+        assert pool.standby is None
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_repair_standby_installs_on_success():
+    """Probe + connect success installs the new standby session."""
+    pool, _, _, _ = await _started_pool()
+    try:
+        pool.standby = None
+        replacement = _fake_deako()
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=True),
+        ):
+            with patch(
+                "pydeako.deako._connection_pool.Deako",
+                return_value=replacement,
+            ):
+                assert await pool._repair_standby() is True
+        assert pool.standby is replacement
+        assert replacement.devices is pool._devices
+        assert (
+            replacement.connection_manager.auto_reconnect is False
+        )
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_repair_aborts_if_failover_host_changed_mid_connect():
+    """A flip during repair invalidates the target; do not install."""
+    pool, _, _, _ = await _started_pool()
+    try:
+        pool.standby = None
+        replacement = _fake_deako()
+
+        async def connect_and_mutate():
+            # Simulate a concurrent flip while the connect ran.
+            pool.failover_host = "10.0.0.1"
+            pool.primary_host = "10.0.0.2"
+
+        replacement.connect = AsyncMock(
+            side_effect=connect_and_mutate,
+        )
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=True),
+        ):
+            with patch(
+                "pydeako.deako._connection_pool.Deako",
+                return_value=replacement,
+            ):
+                assert await pool._repair_standby() is False
+        assert pool.standby is None
+        replacement.disconnect.assert_awaited()
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_recovered_bridge_returns_as_standby_not_active():
+    """Anti-flap: repair fills the standby slot; no auto flip-back."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        # Active dies; flip promotes standby.
+        active.is_connected.return_value = False
+        assert await pool._flip("10.0.0.1") is True
+        assert pool.primary_host == "10.0.0.2"
+        # Old primary host recovers; supervisor repairs it.
+        pool._last_flip = 0.0
+        recovered = _fake_deako()
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=True),
+        ):
+            with patch(
+                "pydeako.deako._connection_pool.Deako",
+                return_value=recovered,
+            ):
+                assert await pool._repair_standby() is True
+        # Roles: recovered host is STANDBY; active untouched.
+        assert pool.active is standby
+        assert pool.standby is recovered
+        assert pool.primary_host == "10.0.0.2"
+        assert pool.failover_host == "10.0.0.1"
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_loop_repairs_when_kicked():
+    """End-to-end: dead standby, kick, supervisor installs repair."""
+    pool, _, standby, _ = await _started_pool()
+    try:
+        pool.standby = None
+        pool._last_flip = 0.0
+        replacement = _fake_deako()
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=True),
+        ):
+            with patch(
+                "pydeako.deako._connection_pool.Deako",
+                return_value=replacement,
+            ):
+                pool._repair_wake.set()
+                for _ in range(50):
+                    await asyncio.sleep(0)
+                    if pool.standby is replacement:
+                        break
+        assert pool.standby is replacement
+        _ = standby
+    finally:
+        await pool.stop()
+
+
+# --- standby verification -------------------------------------------
+
+@pytest.mark.asyncio
+async def test_verify_standby_once_runs_find_devices_once():
+    """Fresh standby answers device-list exactly once; flag latches."""
+    pool, _, standby, _ = await _started_pool()
+    try:
+        assert pool._standby_found is False
+        await pool._verify_standby_once()
+        standby.find_devices.assert_awaited_once()
+        await pool._verify_standby_once()
+        standby.find_devices.assert_awaited_once()
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_verify_standby_tolerates_failure():
+    """Device-list failure on standby is logged, session kept."""
+    pool, _, standby, _ = await _started_pool()
+    try:
+        standby.find_devices = AsyncMock(
+            side_effect=OSError("timeout"),
+        )
+        await pool._verify_standby_once()
+        assert pool.standby is standby
+        assert pool._standby_found is True
+    finally:
+        await pool.stop()
+
+
+# --- event counters --------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_event_counters_track_per_host():
+    """on_event_seen wiring increments the right host's counter."""
+    active = _fake_deako()
+    standby = _fake_deako()
+    with patch(
+        "pydeako.deako._connection_pool.Deako",
+        side_effect=[active, standby],
+    ) as deako_cls:
+        pool = _pool()
+        await pool.start()
+    try:
+        seen_active = deako_cls.call_args_list[0].kwargs[
+            "on_event_seen"
+        ]
+        seen_standby = deako_cls.call_args_list[1].kwargs[
+            "on_event_seen"
+        ]
+        seen_active()
+        seen_active()
+        seen_standby()
+        counts = pool.event_counts()
+        assert counts["10.0.0.1"] == 2
+        assert counts["10.0.0.2"] == 1
+        # Copy, not the live dict.
+        counts["10.0.0.1"] = 99
+        assert pool.event_counts()["10.0.0.1"] == 2
+    finally:
+        await pool.stop()
+
+
+# --- shared-cache continuity across flip ------------------------------
+
+@pytest.mark.asyncio
+async def test_cache_and_callbacks_survive_flip():
+    """State and callbacks are continuous across a flip."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        cb = MagicMock()
+        pool._devices["u"] = {
+            "name": "Lamp",
+            "state": {"power": True, "dim": 10},
+        }
+        pool.set_state_callback("u", cb)
+        active.is_connected.return_value = False
+        assert await pool._flip("10.0.0.1") is True
+        assert pool.active is standby
+        assert pool.get_state("u") == {"power": True, "dim": 10}
+        assert pool._devices["u"]["callback"] is cb
+    finally:
+        await pool.stop()

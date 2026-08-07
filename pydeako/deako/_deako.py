@@ -44,6 +44,7 @@ class Deako:
         get_address,
         client_name: str | None = None,
         on_connection_lost: Callable | None = None,
+        on_event_seen: Callable | None = None,
     ) -> None:
         """Init manager for Deako local integration.
 
@@ -54,6 +55,13 @@ class Deako:
                 underlying _Manager when the connection drops (ping
                 timeout). Forwarded as-is so the connection pool can
                 hook failover on connection loss.
+            on_event_seen: Optional zero-arg callback invoked for every
+                EVENT-type message this session receives, before the
+                state update is applied. The connection pool uses it
+                to count per-bridge event deliveries (observability
+                for multi-session setups). Exceptions are swallowed
+                after a DEBUG log so instrumentation can never break
+                state handling.
         """
         self.connection_manager = _Manager(
             get_address,
@@ -63,6 +71,7 @@ class Deako:
         )
         self.devices: dict[str, Any] = {}
         self.expected_devices = 0
+        self._on_event_seen = on_event_seen
 
     def update_state(
         self, uuid: str, power: bool, dim: int | None = None,
@@ -107,6 +116,13 @@ class Deako:
                     state.get("dim"),
                 )
             elif in_data["type"] == ResponseType.EVENT:
+                if self._on_event_seen is not None:
+                    try:
+                        self._on_event_seen()
+                    except Exception as exc:  # pylint: disable=broad-exception-caught
+                        _LOGGER.debug(
+                            "on_event_seen callback error: %s", exc,
+                        )
                 subdata = in_data["data"]
                 state = subdata["state"]
                 self.update_state(

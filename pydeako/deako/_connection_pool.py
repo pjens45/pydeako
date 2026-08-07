@@ -1,21 +1,45 @@
 """
-Connection pool for Deako bridges with primary/failover support.
+Connection pool for Deako bridges: two fully-managed sessions.
 
-Manages two bridge connections:
-  - An active primary Deako used for live device commands.
-  - A standby bridge held warm by a single TCP keepalive socket so
-    that a failover switch does not have to wait for the bridge to
-    leave idle mode.
+Architecture (two-manager model): the pool holds a real `Deako`
+session on BOTH bridges. Exactly one is `active` (all commands route
+to it); the other is `standby`. The standby's session doubles as the
+bridge-mode keepalive (holding TCP on port 23 is what kept the old
+`_KeepAliveSocket` design warm) while also maintaining a live device
+cache and a ping worker.
 
-Recovery is caller-driven. There is no background health monitor and
-no periodic task. The `control_device()` send path triggers at most
-one failover switch per call on a real send failure; once the pool
-is in a degraded state the next `control_device()` call invokes a
-two-host recovery routine that probes and connects to
-`primary_host` first, then `failover_host`.
+Failover is a pointer flip. When the active fails (send OSError or
+the manager's ping timeout), the pool promotes the connected standby
+in place: swap roles, retry the command once, done. There is no
+teardown-then-reconnect at the worst moment, no bridge-recycle wait,
+and no device-list exchange on the critical path.
 
-`stop()` is terminal. A stopped pool is not restartable. Callers
-that want a fresh pool must construct a new one. Host names
+Repair is background and bounded. A single supervisor task owns ALL
+reconnection: it probe-gates (tcp probe before any connect attempt)
+and backs off exponentially up to a cap, so a permanently missing
+bridge is polled gently instead of hammered. Neither manager ever
+self-reconnects (`auto_reconnect` is forced off on both); this is
+load-bearing, see the Gen1 stale-bridge lesson in the integration
+docs.
+
+Anti-flap by construction: only an active failure triggers a flip,
+and the supervisor only ever fills the STANDBY slot. A recovered
+bridge comes back as standby; nothing auto-promotes it. Role flapping
+therefore requires the active to actually fail each time.
+
+State continuity: all sessions share one device-cache dict owned by
+the pool, so a flip serves exactly the state the old active had, and
+EVENT traffic from either bridge upserts the same entries. Device
+state callbacks live inside that shared dict and survive flips
+without replay.
+
+Instrumentation: the pool counts EVENT deliveries per host (via
+`Deako.on_event_seen`) and the supervisor logs both counters at
+DEBUG. A growing standby-host counter while that host is standby is
+direct evidence the firmware relays profile events to secondary
+sessions.
+
+`stop()` is terminal. A stopped pool is not restartable. Host names
 (`primary_host`, `failover_host`) are `str` for the lifetime of the
 pool and never nulled out on any path; degraded state is signaled
 through `ConnectionPoolState`, not missing host fields.
@@ -27,8 +51,8 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
-from ._deako import Deako, FindDevicesError
-from .utils._socket import NoSocketException, _SocketConnection
+from ._deako import Deako
+from .utils._socket import NoSocketException
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
@@ -37,25 +61,24 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 # shared port constant, so the pool owns this value at module scope.
 DEAKO_DEFAULT_PORT = 23
 
-# Upper bound on waiting for a concurrent switch to complete.
-SWITCH_WAIT_TIMEOUT_S = 10.0
-
-# Bounded connect-with-retry budget used by `_switch_to_failover`
-# and `_attempt_recovery`.
-SWITCH_CONNECT_RETRIES = 3
-SWITCH_CONNECT_BACKOFF_S = 1.0
-
-# Upper bound on `_wait_ready` for the failover host to accept
-# TCP connections after a recycle.
-BRIDGE_RECYCLE_TIMEOUT_S = 10.0
-
-# Upper bound on a single `_tcp_probe` call.
+# tcp_probe connect budget.
 PROBE_TIMEOUT = 3.0
 
-# Per-step teardown bound applied to `keepalive.stop()` and
-# `active.disconnect()` in `stop()`, `_switch_to_failover`, and
-# `_attempt_recovery`. Small on purpose: teardown never waits long.
+# Unified bounded-teardown budget for disconnects and stops.
 STEP_TIMEOUT_S = 2.0
+
+# Supervisor cadence: base interval between repair passes when there
+# is something to repair. Doubles on consecutive failures for a given
+# target up to REPAIR_BACKOFF_MAX_S, resets on success. A healthy
+# pool's supervisor sleeps on an Event and wakes only when kicked.
+REPAIR_TICK_S = 15.0
+REPAIR_BACKOFF_MAX_S = 600.0
+
+# Grace period after a flip before the supervisor may probe the
+# demoted host: the bridge that just died is often rebooting or
+# recycling its single TCP slot, and probing it instantly wastes an
+# attempt (and a backoff doubling) on a known-bad window.
+REPAIR_SETTLE_S = 5.0
 
 
 async def _tcp_probe(
@@ -63,101 +86,41 @@ async def _tcp_probe(
     port: int = DEAKO_DEFAULT_PORT,
     timeout: float = PROBE_TIMEOUT,
 ) -> bool:
-    """Bounded TCP reachability check. Module-private.
+    """Return True iff ``host:port`` accepts a TCP connection.
 
-    Returns True iff a TCP connection to ``host:port`` could be
-    established within ``timeout`` seconds. A successful TCP accept
-    only proves the port is open—it does not guarantee the bridge is
-    ready to speak the Deako protocol. Callers follow this with
-    ``Deako.connect()`` + ``find_devices()`` (via ``_connect_primary``)
-    as the real readiness gate.
+    Opens and immediately closes a connection. Used by the repair
+    supervisor to gate connect attempts so a dead host costs one
+    cheap probe, not a full connect + device-list budget.
     """
     try:
-        _, writer = await asyncio.wait_for(
+        reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
             timeout=timeout,
         )
-    except (OSError, asyncio.TimeoutError):
+    except (OSError, asyncio.TimeoutError) as exc:
+        _LOGGER.debug("_tcp_probe(%s:%d) failed: %s", host, port, exc)
         return False
     try:
         writer.close()
         try:
             await writer.wait_closed()
-        except OSError:
+        except (OSError, asyncio.TimeoutError):
             pass
-    except OSError:
+    except Exception:  # pylint: disable=broad-exception-caught
         pass
+    _ = reader
     return True
-
-
-class _KeepAliveSocket:
-    """Raw TCP socket held open to a Deako bridge.
-
-    A Deako bridge stays in WiFi-relay mode as long as some TCP
-    connection is held open on port 23. The pool keeps one such
-    socket open to the current standby bridge so the bridge is
-    warm the instant a failover runs.
-
-    `start()` and `stop()` are both awaitable. All pool-level
-    callers wrap `stop()` in
-    `asyncio.wait_for(..., timeout=STEP_TIMEOUT_S)` after
-    checking that the pool's keepalive reference is non-None.
-    """
-
-    def __init__(
-        self, host: str, port: int = DEAKO_DEFAULT_PORT,
-    ) -> None:
-        """Record target host and port without opening anything."""
-        self.host = host
-        self.port = port
-        self._address = f"{host}:{port}"
-        self._socket: _SocketConnection | None = None
-        self._running = False
-
-    async def start(self) -> None:
-        """Open the keepalive socket.
-
-        Raises OSError on connect failure. Pool-level callers treat
-        that failure as non-fatal: log WARNING and proceed with
-        `self._keepalive = None`.
-        """
-        loop = asyncio.get_running_loop()
-        sock = _SocketConnection(self._address, loop)
-        await sock.connect_socket()
-        self._socket = sock
-        self._running = True
-
-    async def stop(self) -> None:
-        """Close the keepalive socket. Always safe to await.
-
-        Idempotent: a second call after the first is a no-op.
-        Awaitable so pool-level callers can wrap the call in
-        `asyncio.wait_for` with `STEP_TIMEOUT_S`. The inner
-        `_SocketConnection.close_socket` is a synchronous system
-        call with no waitable work today, but the async signature
-        is part of the pool contract and lets the inner call add
-        awaitable teardown later without changing call sites.
-        """
-        self._running = False
-        if self._socket is not None:
-            self._socket.close_socket()
-            self._socket = None
-
-    def is_running(self) -> bool:
-        """Return True iff the keepalive is currently held open."""
-        if not self._running or self._socket is None:
-            return False
-        return self._socket.sock is not None
 
 
 @dataclass(frozen=True)
 class ConnectionPoolState:
     """Immutable snapshot of the pool's state.
 
-    Exactly five fields. Pull-only via `DeakoConnectionPool.state()`.
-    `primary_host` and `failover_host` are `str` for the lifetime
-    of the pool and are never set to None on any code path; degraded
-    state is represented by the boolean flags.
+    Exactly five fields, unchanged from the keepalive-era contract.
+    `failover_keepalive_active` is reinterpreted as "the standby
+    SESSION is connected": a live standby session holds the bridge's
+    TCP slot exactly like the old keepalive socket did, so existing
+    consumers keep their meaning (True == warm standby ready).
     """
 
     primary_host: str
@@ -168,29 +131,25 @@ class ConnectionPoolState:
 
 
 class DeakoConnectionPool:
-    """Primary-failover connection pool for Deako bridges.
+    """Primary/standby pool with two managed sessions.
 
-    Recovery is caller-driven: there is no background health monitor.
-    A failed send on the active primary triggers exactly one
-    `_switch_to_failover` attempt inside the same `control_device`
-    call, plus one retry on the new active. Once the pool enters a
-    degraded state (no connected active), the next `control_device`
-    call runs `_attempt_recovery` which tries both hosts in
-    deterministic order and raises `NoSocketException` with a
-    host-annotated message on failure.
+    Public contract is unchanged from the keepalive-era pool:
+    constructor signature, `start()` fail-fast on the primary,
+    terminal `stop()`, `control_device()` raising
+    `NoSocketException` when nothing usable remains, `state()`,
+    `is_connected()`, `set_state_callback()`, and the device
+    accessors. `on_failover_switch` fires after every successful
+    flip with (new_primary_host, new_failover_host).
 
     `stop()` is terminal. Calling `start()` after `stop()` raises
     `RuntimeError`. `control_device()` after `stop()` raises
     `NoSocketException`.
-
-    State callbacks registered via `set_state_callback` are stored
-    on the pool itself and replayed onto the new active `Deako`
-    after every successful switch or recovery, so user callbacks
-    survive bridge failover without re-registration.
     """
 
     # pylint: disable=too-many-instance-attributes
+
     active: Deako | None
+    standby: Deako | None
 
     def __init__(
         self,
@@ -203,20 +162,17 @@ class DeakoConnectionPool:
 
         Args:
             primary_host: IP address of the primary bridge. Required.
-            failover_host: IP address of the failover bridge. Required;
-                this PR does not support single-bridge pools (use
-                `Deako` directly for that).
+            failover_host: IP address of the failover bridge.
+                Required; single-bridge callers use `Deako` directly.
             client_name: Optional client name sent in protocol
                 messages; forwarded to every `Deako` the pool owns.
             on_failover_switch: Optional sync callback invoked after
-                a successful switch or recovery with the new primary
-                host and the new failover host. Exceptions raised by
-                the callback are logged at WARNING and swallowed so
-                they never destabilize the pool.
+                a successful flip with the new primary host and the
+                new failover host. Exceptions raised by the callback
+                are logged at WARNING and swallowed.
 
         Concurrent `start()` calls on the same pool are unsupported:
-        callers must serialize setup. Home Assistant's single-thread
-        async setup satisfies this naturally.
+        callers must serialize setup.
         """
         if primary_host == failover_host:
             raise ValueError(
@@ -230,31 +186,42 @@ class DeakoConnectionPool:
         self._on_failover_switch = on_failover_switch
 
         self.active: Deako | None = None
-        self._keepalive: _KeepAliveSocket | None = None
+        self.standby: Deako | None = None
 
-        # Pool-owned callback registry. Replayed onto the new active
-        # after every successful switch / recovery.
+        # Shared device cache. Every Deako the pool constructs has
+        # its `devices` attribute pointed at this dict, so state and
+        # callbacks are continuous across flips and both sessions
+        # upsert the same entries from their own EVENT streams.
+        self._devices: dict = {}
+
+        # Pool-owned callback registry. Applied into the shared
+        # device dict (entries may not exist yet at registration
+        # time; `_apply_callbacks` re-applies after device loads).
         self._state_callbacks: dict[str, Callable[[], None]] = {}
 
-        # Switch serialization primitives.
-        self._switch_lock: asyncio.Lock = asyncio.Lock()
-        self._switch_event: asyncio.Event = asyncio.Event()
-        self._switch_event.set()
+        # Per-host EVENT delivery counters (firmware experiment:
+        # does a standby session receive profile events?).
+        self._event_counts: dict[str, int] = {
+            primary_host: 0,
+            failover_host: 0,
+        }
+
+        # Flip serialization.
+        self._flip_lock: asyncio.Lock = asyncio.Lock()
+        self._last_flip: float = 0.0
+
+        # Repair supervisor.
+        self._repair_wake: asyncio.Event = asyncio.Event()
+        self._supervisor_task: asyncio.Task | None = None
+        self._standby_found: bool = False
+
+        # Tasks scheduled from sync manager callbacks (session-lost
+        # dispatch, demoted-session teardown). Held so asyncio does
+        # not GC them mid-flight; discarded on completion.
+        self._bg_tasks: set[asyncio.Task] = set()
 
         self._started: bool = False
         self._stopped: bool = False
-
-        # Scratch reference for `_cleanup_partial_connect`, populated
-        # by `_connect_primary` while a connect is in flight and
-        # cleared on success. Defined in __init__ so pylint is happy
-        # and the attribute exists even if a caller invokes
-        # `_cleanup_partial_connect` before any connect attempt.
-        self._partial_deako: Deako | None = None
-
-        # Tasks scheduled by `_on_active_connection_lost` when the
-        # Manager's ping-timeout fires on the active. Held so asyncio
-        # does not GC them mid-switch; discarded on completion.
-        self._on_lost_tasks: set[asyncio.Task] = set()
 
     # ----- Observability ---------------------------------------
 
@@ -263,25 +230,24 @@ class DeakoConnectionPool:
         primary_connected = (
             self.active is not None and self.active.is_connected()
         )
-        keepalive_active = (
-            self._keepalive is not None
-            and self._keepalive.is_running()
+        standby_connected = (
+            self.standby is not None and self.standby.is_connected()
         )
         return ConnectionPoolState(
             primary_host=self.primary_host,
             failover_host=self.failover_host,
             primary_connected=primary_connected,
-            failover_keepalive_active=keepalive_active,
+            failover_keepalive_active=standby_connected,
             started=self._started and not self._stopped,
         )
 
     def is_connected(self) -> bool:
-        """Return True iff the active primary is currently connected.
-
-        Uses `Deako.is_connected()` so the pool does not reach
-        through manager internals to check socket state.
-        """
+        """Return True iff the active session is currently connected."""
         return self.active is not None and self.active.is_connected()
+
+    def event_counts(self) -> dict[str, int]:
+        """Return a copy of the per-host EVENT delivery counters."""
+        return dict(self._event_counts)
 
     # ----- State callbacks -------------------------------------
 
@@ -290,189 +256,67 @@ class DeakoConnectionPool:
     ) -> None:
         """Register a sync state-change callback for a device.
 
-        The callback is stored on the pool and automatically replayed
-        onto the new active `Deako` after every successful failover
-        switch or recovery, so user callbacks survive bridge swaps
-        without re-registration. Callback shape matches
-        `Deako.set_state_callback`: sync only, zero arguments.
+        Stored on the pool and written into the shared device dict,
+        where `Deako.update_state` invokes it. Because the dict is
+        shared by both sessions, callbacks survive flips without
+        replay; when both bridges relay the same event the callback
+        can fire twice per change, which consumers must tolerate
+        (Home Assistant's schedule-update path is idempotent).
         """
         self._state_callbacks[uuid] = callback
-        if self.active is not None:
-            self.active.set_state_callback(uuid, callback)
+        entry = self._devices.get(uuid)
+        if entry is not None:
+            entry["callback"] = callback
 
-    def _replay_callbacks(self, deako: Deako) -> None:
-        """Register all stored callbacks on a fresh `Deako`.
+    def _apply_callbacks(self) -> None:
+        """Write registered callbacks into existing device entries.
 
-        Called on the success path of `_switch_to_failover` and
-        `_attempt_recovery` so the new active picks up every
-        previously-registered state-change listener.
+        Called after any device-list load so callbacks registered
+        before a device entry existed still land in the dict.
         """
         for uuid, callback in self._state_callbacks.items():
-            deako.set_state_callback(uuid, callback)
+            entry = self._devices.get(uuid)
+            if entry is not None:
+                entry["callback"] = callback
 
-    # ----- Device accessors (proxied to active) ----------------
+    # ----- Device accessors ------------------------------------
 
     def get_devices(self) -> dict:
-        """Return known devices from the active connection, or {}."""
-        if self.active is None:
-            return {}
-        return self.active.get_devices()
+        """Return the shared device cache."""
+        return self._devices
 
     def get_state(self, uuid: str) -> dict | None:
-        """Get a device's state from the active connection."""
-        if self.active is None:
+        """Get a device's state by uuid from the shared cache."""
+        device = self._devices.get(uuid)
+        if device is None:
             return None
-        return self.active.get_state(uuid)
+        return device.get("state")
 
     def get_name(self, uuid: str) -> str | None:
-        """Get a device's name from the active connection."""
-        if self.active is None:
+        """Get a device's name by uuid from the shared cache."""
+        device = self._devices.get(uuid)
+        if device is None:
             return None
-        return self.active.get_name(uuid)
+        return device.get("name")
 
     def is_dimmable(self, uuid: str) -> bool | None:
-        """Return whether a device is dimmable, via active."""
-        if self.active is None:
+        """Get whether a device is dimmable from the shared cache."""
+        device = self._devices.get(uuid)
+        if device is None:
             return None
-        return self.active.is_dimmable(uuid)
+        return device.get("dimmable")
 
-    # ----- Lifecycle -------------------------------------------
+    # ----- Session construction --------------------------------
 
-    async def start(self) -> None:
-        """Connect to the primary and attach a warm standby.
+    def _build_session(self, host: str) -> Deako:
+        """Construct a pool-owned `Deako` for ``host``.
 
-        Fail-fast: raises `NoSocketException` if the primary cannot
-        be reached. A best-effort `_KeepAliveSocket` is then started
-        on `failover_host`; keepalive failure is non-fatal and leaves
-        `self._keepalive = None`.
-
-        Idempotent after first success: a subsequent `start()` on
-        an already-started pool is a no-op. A failed initial
-        `start()` leaves the pool unstarted (`_started=False`,
-        `active=None`, `_keepalive=None`) so a later retry can
-        succeed normally. `start()` after `stop()` raises
-        `RuntimeError`; the pool is single-use.
-
-        Concurrent `start()` calls are unsupported.
-        """
-        if self._stopped:
-            raise RuntimeError(
-                "DeakoConnectionPool: start() after stop() is not "
-                "supported; construct a new pool",
-            )
-        if self._started:
-            return
-        # Connect primary first. Failure is fatal to start().
-        try:
-            new_active = await self._connect_primary(self.primary_host)
-        except FindDevicesError:
-            # connect() succeeded but the device-list exchange failed.
-            # The partial Deako is fully connected with a live ping
-            # worker; it MUST be torn down here or it holds the
-            # bridge's single TCP slot indefinitely (every later
-            # connect to this host then fails) while the pool reports
-            # itself unstarted.
-            await self._cleanup_partial_connect()
-            raise
-        except (OSError, NoSocketException) as exc:
-            # Leave the pool unstarted so a retry may succeed.
-            await self._cleanup_partial_connect()
-            raise NoSocketException(
-                f"start: primary {self.primary_host} unreachable: "
-                f"{exc}",
-            ) from exc
-        # Post-await stopped re-check. If stop() ran while the long
-        # connect was in flight, discard the freshly connected Deako
-        # rather than installing it on a pool the caller has already
-        # terminated.
-        if await self._discard_if_stopped(new_active):
-            return
-        # Primary is live. Latch started BEFORE best-effort keepalive
-        # so a keepalive failure does not un-set it.
-        self.active = new_active
-        self._started = True
-        # Replay any callbacks that were registered before start().
-        self._replay_callbacks(new_active)
-        # Best-effort warm standby on failover_host.
-        try:
-            await self._start_keepalive(self.failover_host)
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            _LOGGER.warning(
-                "keepalive start on %s failed at start: %s; "
-                "pool proceeds without warm standby",
-                self.failover_host, exc,
-            )
-            self._keepalive = None
-
-    async def stop(self) -> None:
-        """Terminal shutdown. Re-entrant-safe.
-
-        Sets `_stopped=True` first so any in-flight switch method
-        sees it on its next await boundary and bails out. Sets
-        `_switch_event` to unblock any waiters. Then tears down
-        the keepalive and the active connection under
-        `asyncio.wait_for(..., timeout=STEP_TIMEOUT_S)`. Each
-        teardown is None-guarded because `stop()` may run before
-        `start()` completed, after a failed recovery, or
-        mid-partial-connect.
-        """
-        if self._stopped:
-            return
-        self._stopped = True
-        # Release any waiters on the switch completion event.
-        self._switch_event.set()
-        # Cancel any switch task scheduled by a stale
-        # `_on_active_connection_lost` firing. Tasks discard
-        # themselves on completion so this collection only drains
-        # those still in flight.
-        for task in list(self._on_lost_tasks):
-            task.cancel()
-        self._on_lost_tasks.clear()
-        # Belt-and-suspenders: a partial connect may have been left
-        # behind by a caller that didn't (or couldn't) clean up after
-        # a raise out of _connect_primary. stop() is the last line of
-        # defense against that zombie holding the bridge's TCP slot.
-        await self._cleanup_partial_connect()
-        if self._keepalive is not None:
-            try:
-                await asyncio.wait_for(
-                    self._keepalive.stop(),
-                    timeout=STEP_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "keepalive.stop() timed out after %ss; "
-                    "proceeding",
-                    STEP_TIMEOUT_S,
-                )
-            self._keepalive = None
-        if self.active is not None:
-            try:
-                await asyncio.wait_for(
-                    self.active.disconnect(),
-                    timeout=STEP_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "active.disconnect() timed out after %ss; "
-                    "proceeding",
-                    STEP_TIMEOUT_S,
-                )
-            self.active = None
-
-    # ----- Connect helpers -------------------------------------
-
-    async def _connect_primary(self, host: str) -> Deako:
-        """Open and populate a fresh `Deako` on ``host``.
-
-        Used by `start()`, `_switch_to_failover`, and
-        `_attempt_recovery`. Creates a `Deako`, awaits its
-        connect, and calls `find_devices` to populate the device
-        cache. Raises on any failure; the caller is responsible
-        for calling `_cleanup_partial_connect` on the partial
-        object if one was created. This method never mutates pool
-        state beyond returning the new `Deako`; the caller
-        installs it on `self.active` only after success.
+        Wires: shared device dict, per-host EVENT counter, identity-
+        dispatched connection-lost handler, and `auto_reconnect`
+        FORCED OFF. The supervisor owns all reconnection; a manager
+        that self-reconnects can hammer a permanently-gone bridge
+        (the Gen1 stale-record failure class) and race the pool's
+        role bookkeeping.
         """
         port = DEAKO_DEFAULT_PORT
         address = f"{host}:{port}"
@@ -481,307 +325,274 @@ class DeakoConnectionPool:
         async def get_address():
             return address, client
 
+        def on_event_seen() -> None:
+            self._event_counts[host] = (
+                self._event_counts.get(host, 0) + 1
+            )
+
+        holder: list[Deako] = []
+
+        def on_lost() -> None:
+            if holder:
+                self._schedule_session_lost(holder[0])
+
         deako = Deako(
             get_address,
             client_name=self._client_name,
-            on_connection_lost=self._on_active_connection_lost,
+            on_connection_lost=on_lost,
+            on_event_seen=on_event_seen,
         )
-        # The pool owns reconnect via failover; disable the Manager's
-        # built-in auto_reconnect so it cannot race the pool by
-        # reopening the same host while a switch is in flight.
+        holder.append(deako)
+        # Share the device cache before any traffic arrives.
+        deako.devices = self._devices
         deako.connection_manager.auto_reconnect = False
-        # Track the in-progress object so a mid-connect failure can
-        # be cleaned up. The caller invokes
-        # `_cleanup_partial_connect()` on any raise to tear it down.
-        self._partial_deako = deako
-        await deako.connect()
-        await deako.find_devices()
-        self._partial_deako = None
         return deako
 
-    async def _cleanup_partial_connect(self) -> None:
-        """Tear down a half-initialized `Deako` from `_connect_primary`.
+    async def _connect_session(
+        self, host: str, find_devices: bool,
+    ) -> Deako:
+        """Build and connect a session on ``host``.
 
-        Called from the caller of `_connect_primary` after any raise.
-        Defensive None-guard: the partial reference may not exist
-        (e.g. `start()` failed before `_connect_primary` was even
-        called). Disconnect under `asyncio.wait_for` with
-        `STEP_TIMEOUT_S`; swallow `TimeoutError` with the unified
-        warning wording.
+        Raises on failure with the partial session torn down (a
+        leaked half-connected session holds the bridge's single TCP
+        slot until process restart). Cancellation mid-connect also
+        tears down before propagating.
         """
-        partial = self._partial_deako
-        if partial is None:
+        deako = self._build_session(host)
+        try:
+            await deako.connect()
+            if not deako.is_connected():
+                raise NoSocketException(
+                    f"connect to {host} did not reach CONNECTED",
+                )
+            if find_devices:
+                await deako.find_devices()
+                self._apply_callbacks()
+            return deako
+        except BaseException:
+            # BaseException: CancelledError must also tear down.
+            try:
+                await asyncio.wait_for(
+                    deako.disconnect(), timeout=STEP_TIMEOUT_S,
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            raise
+
+    # ----- Lifecycle -------------------------------------------
+
+    async def start(self) -> None:
+        """Connect the primary session and start the supervisor.
+
+        Fail-fast: raises `NoSocketException` if the primary cannot
+        be reached (or `FindDevicesError` if it connects but the
+        device-list exchange fails). The standby session is then
+        attempted best-effort WITHOUT a blocking device-list
+        exchange; on any failure the pool starts degraded and the
+        supervisor repairs in the background.
+
+        Idempotent after first success. `start()` after `stop()`
+        raises `RuntimeError`; the pool is single-use.
+        """
+        if self._stopped:
+            raise RuntimeError(
+                "DeakoConnectionPool: start() after stop() is not "
+                "supported; construct a new pool",
+            )
+        if self._started:
             return
-        self._partial_deako = None
         try:
-            await asyncio.wait_for(
-                partial.disconnect(), timeout=STEP_TIMEOUT_S,
+            new_active = await self._connect_session(
+                self.primary_host, find_devices=True,
             )
-        except asyncio.TimeoutError:
-            _LOGGER.warning(
-                "active.disconnect() timed out after %ss; "
-                "proceeding",
-                STEP_TIMEOUT_S,
+        except NoSocketException as exc:
+            raise NoSocketException(
+                f"start: primary {self.primary_host} unreachable: "
+                f"{exc}",
+            ) from exc
+        except OSError as exc:
+            raise NoSocketException(
+                f"start: primary {self.primary_host} unreachable: "
+                f"{exc}",
+            ) from exc
+        # FindDevicesError propagates as-is (session already torn
+        # down by _connect_session), matching the previous contract.
+        if await self._discard_if_stopped(new_active):
+            return
+        self.active = new_active
+        self._started = True
+
+        # Best-effort standby session. No device-list exchange here:
+        # the shared cache is already populated by the primary, and
+        # the supervisor verifies the standby answers queries later.
+        try:
+            standby = await self._connect_session(
+                self.failover_host, find_devices=False,
             )
+            if await self._discard_if_stopped(standby):
+                return
+            self.standby = standby
+            self._standby_found = False
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            _LOGGER.debug(
-                "partial-connect cleanup error on disconnect: %s",
-                exc,
+            _LOGGER.warning(
+                "standby session on %s failed at start: %s; pool "
+                "proceeds degraded, supervisor will repair",
+                self.failover_host, exc,
             )
+            self.standby = None
 
-    async def _start_keepalive(self, host: str) -> None:
-        """Open a fresh `_KeepAliveSocket` to ``host``.
+        self._repair_wake.set()
+        self._supervisor_task = asyncio.create_task(
+            self._supervisor(),
+        )
 
-        Stores the result in `self._keepalive` on success. Raises
-        on failure; all pool-level callers wrap the call in
-        `try/except Exception` and set `self._keepalive = None`
-        on failure.
-        """
-        keepalive = _KeepAliveSocket(host)
-        await keepalive.start()
-        self._keepalive = keepalive
+    async def stop(self) -> None:
+        """Terminal shutdown. Re-entrant-safe."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._repair_wake.set()
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except (asyncio.CancelledError, Exception):  # pylint: disable=broad-exception-caught
+                pass
+            self._supervisor_task = None
+        for task in list(self._bg_tasks):
+            task.cancel()
+        self._bg_tasks.clear()
+        await self._teardown(self.standby)
+        self.standby = None
+        await self._teardown(self.active)
+        self.active = None
 
-    async def _wait_ready(
-        self,
-        host: str,
-        timeout: float = BRIDGE_RECYCLE_TIMEOUT_S,
-    ) -> bool:
-        """Bounded poll: return True once the host accepts TCP.
-
-        Used by `_switch_to_failover` step 9 to wait out the brief
-        window where the failover bridge is transitioning from
-        standby into active mode. Short-circuits on `_stopped`.
-        """
-        async def _poll() -> bool:
-            while True:
-                if self._stopped:
-                    return False
-                if await _tcp_probe(
-                    host, DEAKO_DEFAULT_PORT, PROBE_TIMEOUT,
-                ):
-                    return True
-                await asyncio.sleep(1.0)
-
-        try:
-            return await asyncio.wait_for(_poll(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return False
-
-    async def _discard_if_stopped(self, deako: Deako) -> bool:
-        """If the pool is stopped, disconnect ``deako`` and return True.
-
-        Used after an async connect returns to check whether stop()
-        ran while the connect was in flight. If so, the freshly
-        connected Deako is disconnected rather than installed.
-        """
-        if not self._stopped:
-            return False
+    async def _teardown(self, deako: Deako | None) -> None:
+        """Bounded, tolerant disconnect of a session (None-safe)."""
+        if deako is None:
+            return
         try:
             await asyncio.wait_for(
                 deako.disconnect(), timeout=STEP_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
             _LOGGER.warning(
-                "active.disconnect() timed out after %ss; "
-                "proceeding",
+                "session disconnect timed out after %ss; proceeding",
                 STEP_TIMEOUT_S,
             )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug("session disconnect error: %s", exc)
+
+    async def _discard_if_stopped(self, deako: Deako) -> bool:
+        """If the pool is stopped, disconnect ``deako``, return True."""
+        if not self._stopped:
+            return False
+        await self._teardown(deako)
         return True
 
-    async def _teardown_keepalive(self) -> None:
-        """Stop and clear the keepalive socket with bounded timeout."""
-        if self._keepalive is not None:
-            try:
-                await asyncio.wait_for(
-                    self._keepalive.stop(),
-                    timeout=STEP_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "keepalive.stop() timed out after %ss; "
-                    "proceeding",
-                    STEP_TIMEOUT_S,
-                )
-            self._keepalive = None
+    # ----- Session-lost dispatch -------------------------------
 
-    async def _teardown_active(self) -> None:
-        """Disconnect and clear the active Deako with bounded timeout."""
-        if self.active is not None:
-            try:
-                await asyncio.wait_for(
-                    self.active.disconnect(),
-                    timeout=STEP_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "active.disconnect() timed out after %ss; "
-                    "proceeding",
-                    STEP_TIMEOUT_S,
-                )
-            self.active = None
+    def _schedule_session_lost(self, deako: Deako) -> None:
+        """Sync entry from a manager's ping-timeout path.
 
-    # ----- on_connection_lost hook -----------------------------
-
-    def _on_active_connection_lost(self) -> None:
-        """Sync callback wired onto every active `Deako`.
-
-        Invoked by `_Manager.maintain_connection_worker` when the
-        ping-timeout path fires. Schedules one
-        `_switch_to_failover` task with `failed_host` set to the
-        current primary. The concurrent-caller path inside
-        `_switch_to_failover` handles re-entry if another switch
-        is already running.
+        Dispatch is by object identity, not host name, so a flip
+        that already swapped roles cannot misroute a stale loss
+        notification: the object either IS the current active (flip)
+        or IS the current standby (drop + repair) or is neither
+        (already superseded; ignore).
         """
         if self._stopped:
             return
-        failed = self.primary_host
         try:
-            task = asyncio.create_task(
-                self._switch_to_failover(failed_host=failed),
-            )
+            task = asyncio.create_task(self._on_session_lost(deako))
         except RuntimeError:
-            # Called from a context with no running loop; this
-            # can happen in edge cases during shutdown. Swallow
-            # so the Manager worker is not destabilized by a
-            # raise inside the sync callback.
             _LOGGER.debug(
-                "no running loop when scheduling switch for %s; "
-                "ignoring",
-                failed,
+                "no running loop for session-lost dispatch; ignoring",
             )
             return
-        self._on_lost_tasks.add(task)
-        task.add_done_callback(self._on_lost_tasks.discard)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
-    # ----- Switch and recovery ---------------------------------
-
-    async def _wait_for_in_flight_switch(
-        self, failed_host: str | None,
-    ) -> bool | None:
-        """Wait for an already-running switch to finish.
-
-        Returns the result (bool) if a switch was in flight, or
-        None if the lock was free and the caller should proceed.
-        """
-        if not self._switch_lock.locked():
-            return None
-        try:
-            await asyncio.wait_for(
-                self._switch_event.wait(),
-                timeout=SWITCH_WAIT_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            return False
-        if failed_host is None:
-            return (
-                self.active is not None
-                and self.active.is_connected()
-            )
-        return self.primary_host != failed_host
-
-    async def _execute_failover_switch(self) -> bool:
-        """Core failover logic after guards pass. Lock must be held.
-
-        Tears down the current keepalive and active, waits for the
-        failover host to accept TCP, connects with retry, and
-        installs the new active on success.
-        """
-        # Release the standby keepalive before connecting. The
-        # bridge only accepts one TCP session, so the keepalive
-        # must be dropped first or it blocks the real Deako
-        # connection to the failover host.
-        await self._teardown_keepalive()
-        await self._teardown_active()
+    async def _on_session_lost(self, deako: Deako) -> None:
+        """Handle a dead session: flip if active, drop if standby."""
         if self._stopped:
-            return False
-        target = self.failover_host
-        ready = await self._wait_ready(
-            target, timeout=BRIDGE_RECYCLE_TIMEOUT_S,
-        )
-        if not ready:
+            return
+        if deako is self.active:
             _LOGGER.warning(
-                "switch: host_not_ready on %s", target,
+                "active session on %s lost (ping timeout); "
+                "attempting flip to standby",
+                self.primary_host,
             )
-            return False
-        new_active = await self._connect_with_retry(target)
-        if new_active is None:
+            flipped = await self._flip(self.primary_host)
+            if not flipped:
+                _LOGGER.error(
+                    "active lost and no connected standby; pool "
+                    "degraded, supervisor repairing",
+                )
+        elif deako is self.standby:
             _LOGGER.warning(
-                "switch: connect_exhausted on %s", target,
+                "standby session on %s lost; supervisor will repair",
+                self.failover_host,
             )
-            return False
-        if await self._discard_if_stopped(new_active):
-            return False
-        await self._install_new_active(
-            target, new_active, "failover switch",
-        )
-        return True
+            self.standby = None
+            self._standby_found = False
+            await self._teardown(deako)
+            self._repair_wake.set()
+        else:
+            _LOGGER.debug(
+                "session-lost for superseded session; ignoring",
+            )
 
-    async def _switch_to_failover(
-        self, failed_host: str | None,
-    ) -> bool:
-        """Switch the active connection to the failover bridge.
+    # ----- Flip -------------------------------------------------
 
-        Called from the `on_connection_lost` path and from the
-        `control_device` hot-failover path with
-        `failed_host = self.primary_host`.
+    async def _flip(self, failed_host: str) -> bool:
+        """Promote the standby in place of a failed active.
 
-        Returns True on success, False on any failure (host not
-        ready, connect exhausted, stopped mid-flight). The host
-        map is only mutated on the success branch.
-
-        The concurrent-caller path waits on `_switch_event` up to
-        `SWITCH_WAIT_TIMEOUT_S`; if `failed_host` is None, success
-        is determined by actual connected state of the new active,
-        otherwise by whether the primary has moved off
-        `failed_host`.
+        Returns True when the pool has a usable active afterwards
+        (including "another flip already handled it"), False when
+        there is no connected standby to promote. Never connects;
+        promotion is a pointer swap. The demoted session is torn
+        down in the background and the supervisor is kicked to
+        rebuild the standby slot.
         """
-        in_flight = await self._wait_for_in_flight_switch(
-            failed_host,
-        )
-        if in_flight is not None:
-            return in_flight
-
-        async with self._switch_lock:
-            self._switch_event.clear()
-            try:
-                if (
-                    failed_host is not None
-                    and failed_host != self.primary_host
-                ):
-                    return True
-                if self._stopped:
-                    return False
-                return await self._execute_failover_switch()
-            finally:
-                self._switch_event.set()
-
-    async def _connect_with_retry(self, host: str) -> Deako | None:
-        """Bounded connect loop used by switch and recovery.
-
-        Tries up to `SWITCH_CONNECT_RETRIES + 1` times with
-        `SWITCH_CONNECT_BACKOFF_S` between attempts. Each failed
-        attempt runs `_cleanup_partial_connect` so we never leave
-        a half-constructed Deako behind. Returns the new Deako on
-        success, or None on exhaustion / stopped.
-        """
-        for attempt in range(SWITCH_CONNECT_RETRIES + 1):
+        async with self._flip_lock:
             if self._stopped:
-                return None
-            try:
-                return await self._connect_primary(host)
-            except Exception:  # pylint: disable=broad-exception-caught
-                await self._cleanup_partial_connect()
-                if attempt == SWITCH_CONNECT_RETRIES:
-                    return None
-                await asyncio.sleep(SWITCH_CONNECT_BACKOFF_S)
-        return None
+                return False
+            if failed_host != self.primary_host:
+                # A concurrent flip already moved the primary off
+                # the failed host; report current health.
+                return (
+                    self.active is not None
+                    and self.active.is_connected()
+                )
+            standby = self.standby
+            if standby is None or not standby.is_connected():
+                self._repair_wake.set()
+                return False
+            demoted = self.active
+            self.active = standby
+            self.standby = None
+            self._standby_found = False
+            self.primary_host, self.failover_host = (
+                self.failover_host, self.primary_host,
+            )
+            self._last_flip = asyncio.get_running_loop().time()
+            _LOGGER.info(
+                "flip succeeded: primary=%s failover=%s",
+                self.primary_host, self.failover_host,
+            )
+            # Background teardown of the demoted session; it is
+            # dead or dying and must not hold its TCP slot.
+            if demoted is not None:
+                task = asyncio.create_task(self._teardown(demoted))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+            self._repair_wake.set()
+            self._fire_on_failover_switch()
+            return True
 
     def _fire_on_failover_switch(self) -> None:
-        """Invoke the user switch callback, swallowing errors.
-
-        Sync-only. Callback errors are logged at
-        WARNING so they never destabilize the pool.
-        """
+        """Invoke the user switch callback, swallowing errors."""
         if self._on_failover_switch is None:
             return
         try:
@@ -793,266 +604,188 @@ class DeakoConnectionPool:
                 "on_failover_switch callback error: %s", exc,
             )
 
-    async def _install_new_active(
-        self, target: str, new_active: Deako, context: str,
-    ) -> None:
-        """Install a freshly connected Deako as the active.
+    # ----- Repair supervisor ------------------------------------
 
-        Swaps the host roles so ``target`` becomes the new primary,
-        replays stored callbacks onto ``new_active``, and starts a
-        best-effort keepalive on the other host. ``context`` labels
-        log messages (e.g. ``"failover switch"`` or ``"recovery"``).
+    async def _supervisor(self) -> None:
+        """Single owner of all reconnection. Bounded and probe-gated.
+
+        Fills the STANDBY slot only; never touches the active and
+        never promotes (anti-flap: promotion happens exclusively in
+        `_flip`, triggered exclusively by active failure). Backoff
+        doubles on consecutive failures up to `REPAIR_BACKOFF_MAX_S`
+        and resets on success or when newly kicked by a state
+        change.
         """
-        other = (
-            self.failover_host
-            if target == self.primary_host
-            else self.primary_host
-        )
-        self.primary_host = target
-        self.failover_host = other
-        self.active = new_active
-        self._replay_callbacks(new_active)
-        try:
-            await self._start_keepalive(other)
-        # pylint: disable-next=broad-exception-caught
-        except Exception as exc:
-            _LOGGER.warning(
-                "keepalive start on %s failed after "
-                "%s: %s; pool proceeds without warm "
-                "standby",
-                other, context, exc,
-            )
-            self._keepalive = None
-        _LOGGER.info(
-            "%s succeeded: primary=%s failover=%s",
-            context, self.primary_host, self.failover_host,
-        )
-        self._fire_on_failover_switch()
-
-    def _fill_both_reasons(
-        self, token: str,
-    ) -> dict[str, str]:
-        """Map both hosts to the same reason token."""
-        return {
-            self.primary_host: token,
-            self.failover_host: token,
-        }
-
-    async def _wait_for_in_flight_recovery(
-        self,
-    ) -> tuple[bool, dict[str, str]] | None:
-        """Wait for an already-running switch/recovery to finish.
-
-        Returns ``(bool, reasons)`` if a switch was in flight, or
-        None if the lock was free and the caller should proceed.
-        """
-        if not self._switch_lock.locked():
-            return None
-        try:
-            await asyncio.wait_for(
-                self._switch_event.wait(),
-                timeout=SWITCH_WAIT_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            return False, self._fill_both_reasons(
-                "switch_wait_timeout",
-            )
-        if (
-            self.active is not None
-            and self.active.is_connected()
-        ):
-            return True, {}
-        return False, self._fill_both_reasons(
-            "in_flight_switch_failed",
-        )
-
-    async def _try_recovery_candidate(
-        self, target: str,
-    ) -> bool | str:
-        """Probe and connect to a single candidate during recovery.
-
-        Returns True on success (new active installed), False if the
-        pool was stopped mid-attempt, or a reason-token string on
-        failure (``"tcp_probe_failed"`` or ``"connect_exhausted"``).
-        """
-        if not await _tcp_probe(
-            target, DEAKO_DEFAULT_PORT, PROBE_TIMEOUT,
-        ):
-            return "tcp_probe_failed"
-        new_deako = await self._connect_with_retry(target)
-        if new_deako is None:
+        backoff = REPAIR_TICK_S
+        while not self._stopped:
+            try:
+                await asyncio.wait_for(
+                    self._repair_wake.wait(), timeout=backoff,
+                )
+                # Kicked: a fresh condition, restart gentle.
+                backoff = REPAIR_TICK_S
+            except asyncio.TimeoutError:
+                pass
+            self._repair_wake.clear()
             if self._stopped:
-                return False
-            return "connect_exhausted"
-        if await self._discard_if_stopped(new_deako):
+                return
+            _LOGGER.debug(
+                "supervisor: event_counts=%s devices=%d "
+                "standby_connected=%s",
+                self._event_counts,
+                len(self._devices),
+                self.standby is not None
+                and self.standby.is_connected(),
+            )
+            if (
+                self.standby is not None
+                and self.standby.is_connected()
+            ):
+                await self._verify_standby_once()
+                continue
+            # Respect the post-flip settle window.
+            loop = asyncio.get_running_loop()
+            if (
+                self._last_flip
+                and loop.time() - self._last_flip < REPAIR_SETTLE_S
+            ):
+                backoff = REPAIR_TICK_S
+                continue
+            repaired = await self._repair_standby()
+            if repaired:
+                backoff = REPAIR_TICK_S
+            else:
+                backoff = min(backoff * 2, REPAIR_BACKOFF_MAX_S)
+                _LOGGER.debug(
+                    "supervisor: standby repair failed; next "
+                    "attempt in %.0fs", backoff,
+                )
+
+    async def _repair_standby(self) -> bool:
+        """One probe-gated attempt to rebuild the standby session."""
+        target = self.failover_host
+        if not await _tcp_probe(target):
+            _LOGGER.debug(
+                "supervisor: %s not accepting TCP; skipping "
+                "connect attempt", target,
+            )
             return False
-        await self._install_new_active(
-            target, new_deako, "recovery",
+        try:
+            standby = await self._connect_session(
+                target, find_devices=False,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOGGER.debug(
+                "supervisor: standby connect to %s failed: %s",
+                target, exc,
+            )
+            return False
+        if await self._discard_if_stopped(standby):
+            return False
+        # The failover host may have changed while we connected
+        # (a flip mid-repair). Identity dispatch keeps this safe:
+        # install only if the target still matches.
+        if target != self.failover_host:
+            await self._teardown(standby)
+            return False
+        self.standby = standby
+        self._standby_found = False
+        _LOGGER.info(
+            "supervisor: standby session restored on %s", target,
         )
         return True
 
-    async def _attempt_recovery(
-        self,
-    ) -> tuple[bool, dict[str, str]]:
-        """Two-host recovery path used only by the no-primary send.
+    async def _verify_standby_once(self) -> None:
+        """One-time device-list verification on a fresh standby.
 
-        Returns `(True, {})` on success and `(False, reasons)` on
-        failure, where `reasons` maps each host to its last reason
-        token (`tcp_probe_failed`, `connect_exhausted`, `stopped`,
-        `switch_wait_timeout`, or `in_flight_switch_failed`).
-        `_ensure_primary_or_raise` uses the reasons dict to build
-        the host-annotated `NoSocketException` message.
-
-        Probe order is deterministic: `self.primary_host` first,
-        `self.failover_host` second. The winner becomes the new
-        active; the loser becomes the warm standby.
+        Data point for the two-manager experiment: does the standby
+        bridge answer queries on its session? Failure is logged and
+        tolerated; the session still holds the TCP slot and still
+        feeds the shared cache with whatever EVENTs it relays.
         """
-        in_flight = await self._wait_for_in_flight_recovery()
-        if in_flight is not None:
-            return in_flight
-
-        async with self._switch_lock:
-            self._switch_event.clear()
-            try:
-                if self._stopped:
-                    return False, self._fill_both_reasons("stopped")
-                # Disconnect stale active and release keepalive
-                # before probing. The bridge only accepts one TCP
-                # session, so recovery must not fight its own
-                # sockets.
-                await self._teardown_active()
-                await self._teardown_keepalive()
-                reasons: dict[str, str] = {}
-                for target in [
-                    self.primary_host, self.failover_host,
-                ]:
-                    if self._stopped:
-                        return (
-                            False,
-                            self._fill_both_reasons("stopped"),
-                        )
-                    result = await self._try_recovery_candidate(
-                        target,
-                    )
-                    if result is True:
-                        return True, {}
-                    if result is False:
-                        return (
-                            False,
-                            self._fill_both_reasons("stopped"),
-                        )
-                    reasons[target] = result
-                return False, reasons
-            finally:
-                self._switch_event.set()
+        if self._standby_found or self.standby is None:
+            return
+        self._standby_found = True
+        try:
+            await self.standby.find_devices()
+            self._apply_callbacks()
+            _LOGGER.info(
+                "standby %s answered device-list (devices=%d)",
+                self.failover_host, len(self._devices),
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            _LOGGER.warning(
+                "standby %s did not answer device-list: %s "
+                "(session kept; EVENT relay may still work)",
+                self.failover_host, exc,
+            )
 
     # ----- control_device send path ----------------------------
-
-    async def _ensure_primary_or_raise(self) -> None:
-        """If no connected primary, run recovery.
-
-        Raises `NoSocketException` with a host-annotated message
-        on recovery failure. Called from `control_device` when
-        `self.active` is None or not connected.
-        """
-        if self._stopped:
-            raise NoSocketException("pool stopped")
-        if (
-            self.active is not None
-            and self.active.is_connected()
-        ):
-            return
-        success, reasons = await self._attempt_recovery()
-        if success:
-            return
-        msg = (
-            f"no primary after recovery: "
-            f"tried primary={self.primary_host} "
-            f"({reasons.get(self.primary_host, 'unknown')}), "
-            f"failover={self.failover_host} "
-            f"({reasons.get(self.failover_host, 'unknown')})"
-        )
-        _LOGGER.error(msg)
-        raise NoSocketException(msg)
 
     async def control_device(
         self, uuid: str, power: bool, dim: int | None = None,
     ) -> None:
-        """Send a device control command through the active pool.
+        """Send a device control command through the active session.
 
-        The pool calls `Deako._control_device_strict` (not the
-        public `control_device`) so send failures raise instead
-        of being swallowed, letting the pool drive failover.
-
-        On `OSError` or `NoSocketException` from the active send,
-        performs exactly one `_switch_to_failover(failed_host=
-        self.primary_host)` and exactly one retry of the strict
-        send on the new active. If the switch returns False, or
-        the retry raises, raises `NoSocketException` naming the
-        host(s) attempted. Does not cascade into
-        `_attempt_recovery`; the next call enters the no-primary
-        path and runs recovery naturally.
+        Uses `Deako._control_device_strict` so send failures raise.
+        On failure of the active: exactly one flip attempt and one
+        retry on the promoted standby. When nothing is usable the
+        call raises `NoSocketException` QUICKLY (no inline connects;
+        the supervisor repairs in the background), which matches the
+        integration's drop-and-recover-in-background contract.
         """
         if self._stopped:
             raise NoSocketException("pool stopped")
-        # No connected primary -> run recovery.
-        if (
-            self.active is None
-            or not self.active.is_connected()
-        ):
-            await self._ensure_primary_or_raise()
-        # Hot path: send via strict. A concurrent stop() can null
-        # self.active between recovery and here; the contract is
-        # NoSocketException on no active connection, not AssertionError
-        # (which -O would strip entirely).
-        if self.active is None:
+        if self.active is None or not self.active.is_connected():
+            flipped = await self._flip(self.primary_host)
+            if not flipped:
+                self._repair_wake.set()
+                raise NoSocketException(
+                    f"no usable connection: active {self.primary_host} "
+                    f"down and standby {self.failover_host} "
+                    f"unavailable; background repair running",
+                )
+        active = self.active
+        if active is None:
             raise NoSocketException(
-                "no active connection after recovery",
+                "no active connection after flip",
             )
         failed_host = self.primary_host
         try:
             # pylint: disable-next=protected-access
-            await self.active._control_device_strict(
-                uuid, power, dim,
-            )
+            await active._control_device_strict(uuid, power, dim)
             return
         except OSError:
             # NoSocketException subclasses OSError.
             _LOGGER.warning(
-                "control_device send failed on active primary "
-                "%s; switching to failover",
+                "control_device send failed on active %s; "
+                "flipping to standby",
                 failed_host,
             )
-        # Single switch attempt.
-        switched = await self._switch_to_failover(
-            failed_host=failed_host,
-        )
-        if not switched:
+        flipped = await self._flip(failed_host)
+        if not flipped:
             msg = (
-                f"control_device failed and failover switch "
-                f"failed; last active host was {failed_host}"
+                f"control_device failed on {failed_host} and no "
+                f"connected standby to flip to"
             )
             _LOGGER.error(msg)
             raise NoSocketException(msg)
-        # Exactly one retry on the new active.
-        new_host = self.primary_host
-        if self.active is None:
-            # A stop() raced the switch and nulled the active; honor the
-            # NoSocketException contract instead of raising AssertionError.
+        new_active = self.active
+        if new_active is None:
             raise NoSocketException(
-                f"failover switch reported success but no active "
-                f"connection remains; last active host was {failed_host}",
+                f"flip reported success but no active session "
+                f"remains; last active host was {failed_host}",
             )
         try:
             # pylint: disable-next=protected-access
-            await self.active._control_device_strict(
-                uuid, power, dim,
-            )
+            await new_active._control_device_strict(uuid, power, dim)
         except OSError as exc:
             msg = (
-                f"control_device failed twice across failover: "
+                f"control_device failed twice across flip: "
                 f"first active={failed_host}, "
-                f"second active={new_host}: {exc}"
+                f"second active={self.primary_host}: {exc}"
             )
             _LOGGER.error(msg)
             raise NoSocketException(msg) from exc
