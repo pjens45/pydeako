@@ -463,12 +463,25 @@ async def test_standby_loss_drops_slot_without_flip():
         on_lost = deako_cls.call_args_list[1].kwargs[
             "on_connection_lost"
         ]
+        # The supervisor is already running and consumes _repair_wake
+        # (clearing it) as soon as it gets a turn, so sampling the flag
+        # after a drain races it and fails. Record the kick instead:
+        # what this test cares about is that standby loss wakes the
+        # supervisor, not that the flag is still set afterwards.
+        kicks: list[None] = []
+        real_set = pool._repair_wake.set
+
+        def _record_kick() -> None:
+            kicks.append(None)
+            real_set()
+
+        pool._repair_wake.set = _record_kick  # type: ignore[method-assign]
         on_lost()
         await _drain()
         assert pool.active is active
         assert pool.primary_host == "10.0.0.1"
         assert pool.standby is None
-        assert pool._repair_wake.is_set()
+        assert kicks, "standby loss must wake the supervisor to repair"
         standby.disconnect.assert_awaited()
     finally:
         await pool.stop()
