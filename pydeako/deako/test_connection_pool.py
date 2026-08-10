@@ -750,3 +750,171 @@ async def test_cache_and_callbacks_survive_flip():
         assert pool._devices["u"]["callback"] is cb
     finally:
         await pool.stop()
+
+
+# --- supervisor active recovery ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_repair_active_promotes_live_standby():
+    """Cheap path: a connected standby is promoted, roles swap."""
+    fired = []
+    pool, active, standby, _ = await _started_pool(
+        on_failover_switch=lambda p, f: fired.append((p, f)),
+    )
+    try:
+        active.is_connected.return_value = False
+        assert await pool._repair_active() is True
+        assert pool.active is standby
+        assert pool.standby is None
+        assert pool.primary_host == "10.0.0.2"
+        assert pool.failover_host == "10.0.0.1"
+        assert fired == [("10.0.0.2", "10.0.0.1")]
+        active.disconnect.assert_awaited()
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_repair_active_reconnects_primary_when_no_standby():
+    """No standby: probe + connect the current primary, keep roles."""
+    fired = []
+    pool, active, standby, _ = await _started_pool(
+        on_failover_switch=lambda p, f: fired.append((p, f)),
+    )
+    try:
+        active.is_connected.return_value = False
+        standby.is_connected.return_value = False
+        # Populated shared cache: recovery must not pay for a
+        # device-list exchange it does not need.
+        pool._devices["u"] = {"name": "Lamp", "state": {"power": False}}
+        replacement = _fake_deako()
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=True),
+        ):
+            with patch(
+                "pydeako.deako._connection_pool.Deako",
+                return_value=replacement,
+            ):
+                assert await pool._repair_active() is True
+        assert pool.active is replacement
+        # Same host stayed primary, so no role-change callback.
+        assert pool.primary_host == "10.0.0.1"
+        assert fired == []
+        # Shared cache was already populated, so no device-list re-fetch.
+        replacement.find_devices.assert_not_awaited()
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_repair_active_falls_back_to_failover_host():
+    """Primary unreachable: failover host becomes the new primary."""
+    fired = []
+    pool, active, standby, _ = await _started_pool(
+        on_failover_switch=lambda p, f: fired.append((p, f)),
+    )
+    try:
+        active.is_connected.return_value = False
+        standby.is_connected.return_value = False
+        replacement = _fake_deako()
+
+        async def probe(host, *a, **k):
+            return host == "10.0.0.2"
+
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(side_effect=probe),
+        ):
+            with patch(
+                "pydeako.deako._connection_pool.Deako",
+                return_value=replacement,
+            ):
+                assert await pool._repair_active() is True
+        assert pool.active is replacement
+        assert pool.primary_host == "10.0.0.2"
+        assert pool.failover_host == "10.0.0.1"
+        assert fired == [("10.0.0.2", "10.0.0.1")]
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_repair_active_returns_false_when_both_hosts_dead():
+    """Neither host answers: report failure, install nothing."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        active.is_connected.return_value = False
+        standby.is_connected.return_value = False
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=False),
+        ):
+            assert await pool._repair_active() is False
+        assert pool.active is None
+        assert pool.standby is None
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_repair_active_noop_when_active_healthy():
+    """A healthy active short-circuits recovery."""
+    pool, active, _, _ = await _started_pool()
+    try:
+        assert await pool._repair_active() is True
+        assert pool.active is active
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_control_device_recovers_inline_after_full_outage():
+    """First command after an outage rebuilds rather than failing."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        active.is_connected.return_value = False
+        standby.is_connected.return_value = False
+        replacement = _fake_deako()
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=True),
+        ):
+            with patch(
+                "pydeako.deako._connection_pool.Deako",
+                return_value=replacement,
+            ):
+                await pool.control_device("u", True, 30)
+        replacement._control_device_strict.assert_awaited_once_with(
+            "u", True, 30,
+        )
+    finally:
+        await pool.stop()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_prioritizes_active_over_standby():
+    """With both slots empty the supervisor fixes the active first."""
+    pool, active, standby, _ = await _started_pool()
+    try:
+        active.is_connected.return_value = False
+        standby.is_connected.return_value = False
+        pool.standby = None
+        pool._last_flip = 0.0
+        replacement = _fake_deako()
+        with patch(
+            "pydeako.deako._connection_pool._tcp_probe",
+            new=AsyncMock(return_value=True),
+        ):
+            with patch(
+                "pydeako.deako._connection_pool.Deako",
+                return_value=replacement,
+            ):
+                pool._repair_wake.set()
+                for _ in range(60):
+                    await asyncio.sleep(0)
+                    if pool.active is replacement:
+                        break
+        assert pool.active is replacement
+    finally:
+        await pool.stop()

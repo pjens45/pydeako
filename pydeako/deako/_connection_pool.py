@@ -637,6 +637,22 @@ class DeakoConnectionPool:
                 self.standby is not None
                 and self.standby.is_connected(),
             )
+            # Active recovery comes first: a pool with no active
+            # cannot serve commands at all, and rebuilding it is
+             # flap-free (there is nothing to flap between).
+            if self.active is None or not self.active.is_connected():
+                recovered = await self._repair_active()
+                if recovered:
+                    backoff = REPAIR_TICK_S
+                    # Fall through on the next tick to refill standby.
+                    self._repair_wake.set()
+                else:
+                    backoff = min(backoff * 2, REPAIR_BACKOFF_MAX_S)
+                    _LOGGER.debug(
+                        "supervisor: active repair failed; next "
+                        "attempt in %.0fs", backoff,
+                    )
+                continue
             if (
                 self.standby is not None
                 and self.standby.is_connected()
@@ -660,6 +676,102 @@ class DeakoConnectionPool:
                     "supervisor: standby repair failed; next "
                     "attempt in %.0fs", backoff,
                 )
+
+    async def _repair_active(self) -> bool:
+        """Rebuild the active session when the pool has none.
+
+        Runs ONLY when there is no usable active, so it carries no
+        flap risk: there is nothing to flap between. Order:
+
+        1. If a connected standby exists, promote it in place (the
+           cheap path; equivalent to a flip with no failed host).
+        2. Otherwise probe the current primary, then the failover
+           host, and install the first that answers as the active.
+
+        Host roles are updated so `primary_host` always names the
+        active, and `on_failover_switch` fires when they change so
+        consumers repaint their bridge cards.
+
+        Device-list exchange is skipped when the shared cache is
+        already populated: an outage does not invalidate uuid->name
+        or dimmable mappings, and live state is reconciled by the
+        EVENT stream. That keeps recovery off the slow path.
+        """
+        async with self._flip_lock:
+            if self._stopped:
+                return False
+            if self.active is not None and self.active.is_connected():
+                return True
+            # Drop a dead active so it cannot hold a bridge TCP slot
+            # we may be about to reconnect to.
+            if self.active is not None:
+                dead = self.active
+                self.active = None
+                await self._teardown(dead)
+            # Cheap path: a live standby is exactly what we need.
+            if self.standby is not None and self.standby.is_connected():
+                promoted = self.standby
+                self.standby = None
+                self._standby_found = False
+                self.active = promoted
+                self.primary_host, self.failover_host = (
+                    self.failover_host, self.primary_host,
+                )
+                self._last_flip = asyncio.get_running_loop().time()
+                _LOGGER.info(
+                    "supervisor: promoted standby to active: "
+                    "primary=%s failover=%s",
+                    self.primary_host, self.failover_host,
+                )
+                self._fire_on_failover_switch()
+                return True
+            # Drop a stale (disconnected) standby before probing, so
+            # it cannot own the slot of a host we try to connect.
+            if self.standby is not None:
+                stale = self.standby
+                self.standby = None
+                self._standby_found = False
+                await self._teardown(stale)
+            for target in (self.primary_host, self.failover_host):
+                if self._stopped:
+                    return False
+                if not await _tcp_probe(target):
+                    _LOGGER.debug(
+                        "supervisor: %s not accepting TCP; skipping "
+                        "active connect", target,
+                    )
+                    continue
+                try:
+                    new_active = await self._connect_session(
+                        target, find_devices=not self._devices,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # pylint: disable=broad-exception-caught
+                    _LOGGER.debug(
+                        "supervisor: active connect to %s failed: %s",
+                        target, exc,
+                    )
+                    continue
+                if await self._discard_if_stopped(new_active):
+                    return False
+                other = (
+                    self.failover_host
+                    if target == self.primary_host
+                    else self.primary_host
+                )
+                changed = target != self.primary_host
+                self.primary_host = target
+                self.failover_host = other
+                self.active = new_active
+                _LOGGER.info(
+                    "supervisor: active session restored on %s "
+                    "(failover=%s)", target, other,
+                )
+                if changed:
+                    self._fire_on_failover_switch()
+                return True
+            return False
 
     async def _repair_standby(self) -> bool:
         """One probe-gated attempt to rebuild the standby session."""
@@ -739,13 +851,19 @@ class DeakoConnectionPool:
         if self._stopped:
             raise NoSocketException("pool stopped")
         if self.active is None or not self.active.is_connected():
-            flipped = await self._flip(self.primary_host)
-            if not flipped:
+            # Promote a live standby if there is one; otherwise take
+            # one bounded, probe-gated shot at rebuilding the active
+            # inline. Without the inline attempt the first command
+            # after a full outage always fails while the supervisor
+            # waits out its backoff, which reads to the user as the
+            # integration being down.
+            recovered = await self._repair_active()
+            if not recovered:
                 self._repair_wake.set()
                 raise NoSocketException(
-                    f"no usable connection: active {self.primary_host} "
-                    f"down and standby {self.failover_host} "
-                    f"unavailable; background repair running",
+                    f"no usable connection: neither "
+                    f"{self.primary_host} nor {self.failover_host} "
+                    f"is reachable; background repair running",
                 )
         active = self.active
         if active is None:

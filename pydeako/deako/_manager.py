@@ -108,9 +108,19 @@ class _Manager:
                 await asyncio.sleep(CONNECTED_POLLING_INTERVAL_S)
                 timeout += CONNECTED_POLLING_INTERVAL_S
             if not connection.is_connected():
-                _LOGGER.error("Failed to connect. Trying again")
+                # Only claim a retry when one is actually scheduled.
+                # With auto_reconnect off (the pool's configuration)
+                # reconnection is owned by the caller, and the old
+                # unconditional "Trying again" made logs read as if
+                # the manager were retrying when it was not.
                 if self.auto_reconnect:
+                    _LOGGER.error("Failed to connect. Trying again")
                     self.create_connection_task()
+                else:
+                    _LOGGER.error(
+                        "Failed to connect; auto_reconnect is off, "
+                        "leaving recovery to the caller",
+                    )
                 # connection is torn down by the finally block below
                 # (not installed), so it isn't closed twice.
                 return
